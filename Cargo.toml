@@ -1,0 +1,14 @@
+[package]
+name = "btf"
+version = "0.1.0"
+edition = "2021"
+categories = ["parser-implementations", "data-structures"]
+homepage = "https://github.com/arcjustin/btf"
+keywords = ["linux", "btf", "bpf", "parser", "ebpf" ]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/arcjustin/btf"
+description = "A library for parsing the BPF type format (BTF)."
+
+[dependencies]
+byteorder = "1.4.3"
