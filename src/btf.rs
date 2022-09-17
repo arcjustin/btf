@@ -5,7 +5,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{
-    BufRead, BufReader, Error as IoError, ErrorKind as IoErrorKind, Read, Seek, SeekFrom,
+    BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom,
 };
 use std::slice::Iter;
 
@@ -33,7 +33,7 @@ impl BtfHeader {
     fn read_with_order<B: ByteOrder, R: Read>(
         reader: &mut R,
         endianess: Endianess,
-    ) -> Result<Self, IoError> {
+    ) -> Result<Self, Error> {
         Ok(Self {
             endianess,
             _version: reader.read_u8()?,
@@ -46,12 +46,12 @@ impl BtfHeader {
         })
     }
 
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self, IoError> {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let magic = reader.read_u16::<LittleEndian>()?;
         match magic {
             0xeb9f => Self::read_with_order::<LittleEndian, _>(reader, Endianess::Little),
             0x9feb => Self::read_with_order::<BigEndian, _>(reader, Endianess::Big),
-            _ => Err(IoError::from(IoErrorKind::InvalidData)),
+            _ => Err(Error::from(ErrorKind::InvalidData)),
         }
     }
 }
@@ -69,7 +69,7 @@ impl BtfRawType {
         id: u32,
         reader: &mut R,
         header: &BtfHeader,
-    ) -> Result<Self, IoError> {
+    ) -> Result<Self, Error> {
         let name_off = reader.read_u32::<B>()?;
         let name = read_string(reader, header, name_off)?;
         let info = reader.read_u32::<B>()?;
@@ -83,22 +83,22 @@ impl BtfRawType {
         })
     }
 
-    pub fn read<R: Read + Seek + BufRead>(
+    fn read<R: Read + Seek + BufRead>(
         id: u32,
         reader: &mut R,
         header: &BtfHeader,
-    ) -> Result<Self, IoError> {
+    ) -> Result<Self, Error> {
         match header.endianess {
             Endianess::Little => Self::read_with_order::<LittleEndian, _>(id, reader, header),
             Endianess::Big => Self::read_with_order::<BigEndian, _>(id, reader, header),
         }
     }
 
-    pub fn get_vlen(&self) -> u16 {
+    fn get_vlen(&self) -> u16 {
         self.info as u16
     }
 
-    pub fn get_kind(&self) -> Result<TypeKind, IoError> {
+    fn get_kind(&self) -> Result<TypeKind, Error> {
         let kind_val = (self.info >> 24) & 0x1f;
         match kind_val {
             0 => Ok(TypeKind::Void),
@@ -121,19 +121,19 @@ impl BtfRawType {
             17 => Ok(TypeKind::DeclTag),
             18 => Ok(TypeKind::TypeTag),
             19 => Ok(TypeKind::Enum64),
-            _ => Err(IoError::from(IoErrorKind::InvalidData)),
+            _ => Err(Error::from(ErrorKind::InvalidData)),
         }
     }
 
-    pub fn get_kind_flag(&self) -> bool {
+    fn get_kind_flag(&self) -> bool {
         ((self.info >> 31) & 0x1) == 0x1
     }
 
-    pub fn get_type(&self) -> u32 {
+    fn get_type(&self) -> u32 {
         self.size_type
     }
 
-    pub fn get_size(&self) -> u32 {
+    fn get_size(&self) -> u32 {
         self.size_type
     }
 }
@@ -142,7 +142,7 @@ fn read_string<R: Read + Seek + BufRead>(
     reader: &mut R,
     header: &BtfHeader,
     offset: u32,
-) -> Result<String, IoError> {
+) -> Result<String, Error> {
     let oldpos = reader.stream_position()?;
     reader.seek(SeekFrom::Start(
         header.hdr_len as u64 + header.str_off as u64 + offset as u64,
@@ -154,19 +154,19 @@ fn read_string<R: Read + Seek + BufRead>(
     match std::str::from_utf8(&raw_str) {
         Ok(s) => {
             if s.is_empty() {
-                return Err(IoError::from(IoErrorKind::InvalidData));
+                return Err(Error::from(ErrorKind::InvalidData));
             }
             reader.seek(SeekFrom::Start(oldpos))?;
             Ok(String::from(&s[0..s.len() - 1]))
         }
-        Err(_) => Err(IoError::from(IoErrorKind::InvalidData)),
+        Err(_) => Err(Error::from(ErrorKind::InvalidData)),
     }
 }
 
 fn read_integer<B: ByteOrder, R: Read + Seek>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let info = reader.read_u32::<B>()?;
     let name = raw_type.name.clone();
     let bits = info as u8;
@@ -196,7 +196,7 @@ fn create_type_map(raw_type: &BtfRawType) -> TypeMap {
 fn read_array<B: ByteOrder, R: Read + Seek>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     Ok(Type::Array(Array {
         id: raw_type.id,
         size: 0,
@@ -209,7 +209,7 @@ fn read_array<B: ByteOrder, R: Read + Seek>(
 fn read_struct_member<B: ByteOrder, R: Read + Seek + BufRead>(
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<StructMember, IoError> {
+) -> Result<StructMember, Error> {
     let name_off = reader.read_u32::<B>()?;
     let name = read_string(reader, header, name_off)?;
     let type_id = reader.read_u32::<B>()?;
@@ -227,7 +227,7 @@ fn read_struct<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let mut members = HashMap::<String, StructMember>::with_capacity(raw_type.get_vlen().into());
     for _ in 0..raw_type.get_vlen() {
         let member = read_struct_member::<B, _>(reader, header)?;
@@ -246,7 +246,7 @@ fn read_union<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let num_members = raw_type.get_vlen() as usize;
     let mut members = HashMap::<String, StructMember>::with_capacity(num_members);
     for _ in 0..num_members {
@@ -266,7 +266,7 @@ fn read_enum_entry<B: ByteOrder, R: Read + Seek + BufRead>(
     reader: &mut R,
     header: &BtfHeader,
     is_64b: bool,
-) -> Result<EnumEntry, IoError> {
+) -> Result<EnumEntry, Error> {
     let name_off = reader.read_u32::<B>()?;
     let name = read_string(reader, header, name_off)?;
     let value = if is_64b {
@@ -282,11 +282,11 @@ fn read_enum<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let is_64b = match raw_type.get_kind() {
         Ok(TypeKind::Enum32) => false,
         Ok(TypeKind::Enum64) => true,
-        _ => return Err(IoError::from(IoErrorKind::InvalidData)),
+        _ => return Err(Error::from(ErrorKind::InvalidData)),
     };
 
     let mut entries = HashMap::<String, EnumEntry>::with_capacity(raw_type.get_vlen().into());
@@ -328,11 +328,11 @@ fn create_typedef(raw_type: &BtfRawType) -> Type {
     })
 }
 
-fn create_function(raw_type: &BtfRawType) -> Result<Type, IoError> {
+fn create_function(raw_type: &BtfRawType) -> Result<Type, Error> {
     let linkage = match raw_type.get_vlen() {
         0 => LinkageKind::Static,
         1 => LinkageKind::Global,
-        _ => return Err(IoError::from(IoErrorKind::InvalidData)),
+        _ => return Err(Error::from(ErrorKind::InvalidData)),
     };
 
     Ok(Type::Function(Function {
@@ -346,7 +346,7 @@ fn create_function(raw_type: &BtfRawType) -> Result<Type, IoError> {
 fn read_function_param<B: ByteOrder, R: Read + Seek + BufRead>(
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<FunctionParam, IoError> {
+) -> Result<FunctionParam, Error> {
     let name_off = reader.read_u32::<B>()?;
     let name = read_string(reader, header, name_off)?;
     let type_id = reader.read_u32::<B>()?;
@@ -358,7 +358,7 @@ fn read_function_proto<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
     header: &BtfHeader,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let mut params: Vec<FunctionParam> = vec![];
     for _ in 0..raw_type.get_vlen() {
         let param = read_function_param::<B, _>(reader, header)?;
@@ -374,11 +374,11 @@ fn read_function_proto<B: ByteOrder, R: Read + Seek + BufRead>(
 fn read_variable<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let linkage = match reader.read_u32::<B>()? {
         0 => LinkageKind::Static,
         1 => LinkageKind::Global,
-        _ => return Err(IoError::from(IoErrorKind::InvalidData)),
+        _ => return Err(Error::from(ErrorKind::InvalidData)),
     };
 
     Ok(Type::Variable(Variable {
@@ -391,7 +391,7 @@ fn read_variable<B: ByteOrder, R: Read + Seek + BufRead>(
 fn read_section_info<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<SectionInfo, IoError> {
+) -> Result<SectionInfo, Error> {
     Ok(SectionInfo {
         id: raw_type.id,
         type_id: reader.read_u32::<B>()?,
@@ -403,7 +403,7 @@ fn read_section_info<B: ByteOrder, R: Read + Seek + BufRead>(
 fn read_data_section<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     let mut sections: Vec<SectionInfo> = vec![];
     for _ in 0..raw_type.get_vlen() {
         let section = read_section_info::<B, _>(raw_type, reader)?;
@@ -428,7 +428,7 @@ fn create_float(raw_type: &BtfRawType) -> Type {
 fn read_decl_tag<B: ByteOrder, R: Read + Seek + BufRead>(
     raw_type: &BtfRawType,
     reader: &mut R,
-) -> Result<Type, IoError> {
+) -> Result<Type, Error> {
     Ok(Type::DeclTag(DeclTag {
         id: raw_type.id,
         name: raw_type.name.clone(),
@@ -452,7 +452,7 @@ impl BtfTypes {
     fn read_with_order<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         header: &BtfHeader,
-    ) -> Result<Self, IoError> {
+    ) -> Result<Self, Error> {
         let type_start = header.hdr_len as u64 + header.type_off as u64;
         let type_end = type_start + header.type_len as u64;
         reader.seek(SeekFrom::Start(type_start))?;
@@ -463,7 +463,7 @@ impl BtfTypes {
         loop {
             match reader.stream_position()? {
                 n if n == type_end => break,
-                n if n > type_end => return Err(IoError::from(IoErrorKind::InvalidData)),
+                n if n > type_end => return Err(Error::from(ErrorKind::InvalidData)),
                 _ => (),
             }
 
@@ -472,7 +472,7 @@ impl BtfTypes {
             let kind = raw_type.get_kind()?;
 
             let new_type = match kind {
-                TypeKind::Void => return Err(IoError::from(IoErrorKind::InvalidData)),
+                TypeKind::Void => return Err(Error::from(ErrorKind::InvalidData)),
                 TypeKind::Integer => read_integer::<B, _>(&raw_type, reader)?,
                 TypeKind::Pointer => Type::Pointer(create_type_map(&raw_type)),
                 TypeKind::Array => read_array::<B, _>(&raw_type, reader)?,
@@ -522,7 +522,20 @@ impl BtfTypes {
         Ok(btf)
     }
 
-    pub fn from_file(path: &str) -> Result<Self, IoError> {
+    /// Parses a file containing raw BTF data and returns a BtfType database.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the BTF file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux");
+    /// ```
+    pub fn from_file(path: &str) -> Result<Self, Error> {
         let mut reader = match File::open(path) {
             Ok(file) => BufReader::new(file),
             Err(e) => return Err(e),
@@ -544,6 +557,20 @@ impl BtfTypes {
         }
     }
 
+    /// Returns a type from a type identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The id of the type to search for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// let first_type = vmlinux_types.get_type_by_id(1).unwrap();
+    /// ```
     pub fn get_type_by_id(&self, id: u32) -> Option<&Type> {
         if id as usize >= self.types.len() {
             None
@@ -552,6 +579,20 @@ impl BtfTypes {
         }
     }
 
+    /// Returns a type given a name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the type to search for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// let task_struct = vmlinux_types.get_type_by_name("task_struct").unwrap();
+    /// ```
     pub fn get_type_by_name(&self, name: &str) -> Option<&Type> {
         match self.name_map.get(name) {
             Some(id) => self.get_type_by_id(*id),
@@ -559,10 +600,44 @@ impl BtfTypes {
         }
     }
 
+    /// Returns an iterator that can be used to iterate all the types contained
+    /// within the parsed BTF database.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// for t in vmlinux_types.iter() {
+    ///     println!("{:?}", t);
+    /// }
+    /// ```
     pub fn iter(&self) -> Iter<Type> {
         self.types.iter()
     }
 
+    /// Returns a fully qualified type given the type identifier. Types that contain
+    /// qualifiers or are pointers are represented as linked types, for example, a
+    /// type that's a typedef to a pointer, like `typedef int *a;` could be represented
+    /// as: `Typedef(id=1, tid=2) -> Pointer(id=2, tid=3) -> Integer(id=3, ...)`. this
+    /// function flattens the link into a single type to make it easier for users.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The id of the type to search for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// let first_type = vmlinux_types.resolve_type_by_id(1).unwrap();
+    /// if first_type.is_volatile {
+    ///     /* this type is volatile */
+    /// }
+    /// ```
     pub fn resolve_type_by_id(&self, mut type_id: u32) -> Option<QualifiedType> {
         let mut qualified_type = QualifiedType::default();
 
@@ -602,6 +677,34 @@ impl BtfTypes {
         }
     }
 
+    /// Returns a fully qualified type given the type name. BTF represents types by
+    /// linking various type ids together, for example, a type that's typedefed to a
+    /// pointer, like `typedef int *a;` could be represented as:
+    ///
+    /// `Typedef(id=1, tid=2) -> Pointer(id=2, tid=3) -> Integer(id=3, ...)`.
+    ///
+    /// This function flattens the links into a single type to make it easier for users
+    /// to work with.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the type to search for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use btf::BtfTypes;
+    /// use btf::types::Type;
+    ///
+    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// let execve = vmlinux_types.resolve_type_by_name("do_execve").unwrap();
+    /// if let Type::FunctionProto(fp) = execve.base_type {
+    ///     let param_type = vmlinux_types.resolve_type_by_id(fp.params[0].type_id).unwrap();
+    ///     if param_type.is_pointer() && param_type.is_volatile {
+    ///         /* the first parameter to do_execve is a volatile pointer */
+    ///     }
+    /// }
+    /// ```
     pub fn resolve_type_by_name(&self, name: &str) -> Option<QualifiedType> {
         match self.name_map.get(name) {
             Some(id) => self.resolve_type_by_id(*id),
