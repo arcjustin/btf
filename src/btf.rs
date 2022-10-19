@@ -4,9 +4,8 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{
-    BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom,
-};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::slice::Iter;
 
 #[derive(Debug)]
@@ -535,7 +534,7 @@ impl BtfTypes {
     ///
     /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux");
     /// ```
-    pub fn from_file(path: &str) -> Result<Self, Error> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let mut reader = match File::open(path) {
             Ok(file) => BufReader::new(file),
             Err(e) => return Err(e),
