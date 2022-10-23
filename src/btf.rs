@@ -609,9 +609,6 @@ impl BtfTypes {
     /// use btf::BtfTypes;
     ///
     /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// for t in vmlinux_types.iter() {
-    ///     println!("{:?}", t);
-    /// }
     /// ```
     pub fn iter(&self) -> Iter<Type> {
         self.types.iter()
