@@ -442,6 +442,7 @@ fn create_type_tag(raw_type: &BtfRawType) -> Type {
     })
 }
 
+#[derive(Default)]
 pub struct BtfTypes {
     types: Vec<Type>,
     name_map: HashMap<String, u32>,
@@ -709,5 +710,126 @@ impl BtfTypes {
             Some(id) => self.resolve_type_by_id(*id),
             None => None,
         }
+    }
+
+    /// Adds a custom integer type to this BTF database.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the new type.
+    /// * `num_bytes` - The number of bytes used to represent the integer.
+    /// * `is_signed` - Whether the integer is signed or not.
+    ///
+    /// # Example
+    /// ```
+    /// use btf::BtfTypes;
+    /// use btf::types::Type;
+    ///
+    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// vmlinux_types.add_integer("my_u32", 4, false).unwrap();
+    /// ```
+    pub fn add_integer(&mut self, name: &str, num_bytes: u8, is_signed: bool) -> Option<&Type> {
+        if num_bytes >= 32 {
+            return None;
+        }
+
+        let id = self.types.len().try_into().ok()?;
+        let new_integer = Integer {
+            id,
+            name: name.to_string(),
+            size: num_bytes.into(),
+            bits: num_bytes * 8,
+            is_bool: false,
+            is_char: false,
+            is_signed,
+            offset: 0,
+        };
+
+        self.name_map.insert(name.to_string(), id);
+        self.types.push(Type::Integer(new_integer));
+
+        self.get_type_by_name(name)
+    }
+
+    /// Adds a custom array type to this BTF database.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the new type.
+    /// * `type_name` - The type of the array elements.
+    /// * `count` - The number of elements
+    ///
+    /// # Example
+    /// ```
+    /// use btf::BtfTypes;
+    /// use btf::types::Type;
+    ///
+    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// vmlinux_types.add_array("my_char_array", "char", 16).unwrap();
+    /// ```
+    pub fn add_array(&mut self, name: &str, type_name: &str, count: u32) -> Option<&Type> {
+        let id = self.types.len().try_into().ok()?;
+        let mut new_array = Array {
+            id,
+            size: 0,
+            element_type: 0,
+            index_type: 0,
+            num_elements: 0,
+        };
+
+        let index_type = self.get_type_by_name("size_t")?;
+        let element_type = self.get_type_by_name(type_name)?;
+        new_array.size = element_type.get_size() * count;
+        new_array.element_type = element_type.get_id()?;
+        new_array.index_type = index_type.get_id()?;
+        new_array.num_elements = count;
+
+        self.name_map.insert(name.to_string(), id);
+        self.types.push(Type::Array(new_array));
+
+        self.get_type_by_name(name)
+    }
+
+    /// Adds a custom structure type to this BTF database.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the new type.
+    /// * `fields` - A tuple describing the fields: `(name, type_name)`.
+    ///
+    /// # Example
+    /// ```
+    /// use btf::BtfTypes;
+    /// use btf::types::Type;
+    ///
+    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
+    /// vmlinux_types.add_struct("my_custom_struct", &[("int_field", "int")]).unwrap();
+    /// ```
+    pub fn add_struct(&mut self, name: &str, fields: &[(&str, &str)]) -> Option<&Type> {
+        let mut new_struct = Struct {
+            id: self.types.len().try_into().ok()?,
+            name: name.to_owned(),
+            size: 0,
+            members: HashMap::new(),
+        };
+
+        for (name, type_name) in fields {
+            let field_type = self.resolve_type_by_name(type_name)?;
+            let type_id = field_type.base_type.get_id()?;
+            let type_size = field_type.get_size();
+            let new_member = StructMember {
+                name: name.to_string(),
+                type_id,
+                bitfield_size: 0,
+                offset: new_struct.size * 8,
+            };
+            new_struct.members.insert(name.to_string(), new_member);
+            new_struct.size += type_size;
+        }
+
+        self.name_map.insert(name.to_string(), new_struct.id);
+        self.types.push(Type::Struct(new_struct));
+
+        self.get_type_by_name(name)
     }
 }

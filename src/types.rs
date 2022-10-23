@@ -197,6 +197,7 @@ impl Type {
     pub fn get_id(&self) -> Option<u32> {
         match self {
             Self::Integer(s) => Some(s.id),
+            Self::Array(s) => Some(s.id),
             Self::Struct(s) => Some(s.id),
             Self::Union(s) => Some(s.id),
             Self::Enum32(s) => Some(s.id),
@@ -229,6 +230,19 @@ impl Type {
             Self::TypeTag(s) => &s.name,
             Self::Enum64(s) => &s.name,
             _ => "<anonymous>",
+        }
+    }
+
+    pub fn get_size(&self) -> u32 {
+        match self {
+            Type::Integer(t) => t.size,
+            Type::Struct(t) => t.size,
+            Type::Union(t) => t.size,
+            Type::Float(t) => t.size,
+            Type::Array(t) => t.size,
+            Type::Enum32(t) => t.size,
+            Type::Enum64(t) => t.size,
+            _ => 0,
         }
     }
 }
