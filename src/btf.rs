@@ -719,11 +719,10 @@ impl BtfTypes {
     ///
     /// # Example
     /// ```
-    /// use btf::BtfTypes;
-    /// use btf::types::Type;
+    /// use btf::{AddToBtf, BtfTypes, Type};
     ///
-    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// vmlinux_types.add_integer("my_u32", 4, false).unwrap();
+    /// let mut btf = BtfTypes::default();
+    /// btf.add_integer("my_u32", 4, false).unwrap();
     /// ```
     pub fn add_integer(&mut self, name: &str, num_bytes: u8, is_signed: bool) -> Option<&Type> {
         if num_bytes >= 32 {
@@ -753,18 +752,26 @@ impl BtfTypes {
     /// # Arguments
     ///
     /// * `name` - The name of the new type.
-    /// * `type_name` - The type of the array elements.
+    /// * `index_type` - The name of the index type.
+    /// * `element_name` - The name of the type of the array elements.
     /// * `count` - The number of elements
     ///
     /// # Example
     /// ```
-    /// use btf::BtfTypes;
-    /// use btf::types::Type;
+    /// use btf::{AddToBtf, BtfTypes, Type};
     ///
-    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// vmlinux_types.add_array("my_char_array", "char", 16).unwrap();
+    /// let mut btf = BtfTypes::default();
+    /// usize::add_to_btf(&mut btf).unwrap();
+    /// u8::add_to_btf(&mut btf).unwrap();
+    /// btf.add_array("my_array", "usize", "u8", 16).unwrap();
     /// ```
-    pub fn add_array(&mut self, name: &str, type_name: &str, count: u32) -> Option<&Type> {
+    pub fn add_array(
+        &mut self,
+        name: &str,
+        index_type: &str,
+        element_type: &str,
+        count: u32,
+    ) -> Option<&Type> {
         let id = self.types.len().try_into().ok()?;
         let mut new_array = Array {
             id,
@@ -774,8 +781,8 @@ impl BtfTypes {
             num_elements: 0,
         };
 
-        let index_type = self.get_type_by_name("size_t")?;
-        let element_type = self.get_type_by_name(type_name)?;
+        let index_type = self.get_type_by_name(index_type)?;
+        let element_type = self.get_type_by_name(element_type)?;
         new_array.size = element_type.get_size() * count;
         new_array.element_type = element_type.get_id()?;
         new_array.index_type = index_type.get_id()?;
@@ -796,11 +803,11 @@ impl BtfTypes {
     ///
     /// # Example
     /// ```
-    /// use btf::BtfTypes;
-    /// use btf::types::Type;
+    /// use btf::{AddToBtf, BtfTypes, Type};
     ///
-    /// let mut vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// vmlinux_types.add_struct("my_custom_struct", &[("int_field", "int")]).unwrap();
+    /// let mut btf = BtfTypes::default();
+    /// u32::add_to_btf(&mut btf).unwrap();
+    /// btf.add_struct("my_custom_struct", &[("int_field", "u32")]).unwrap();
     /// ```
     pub fn add_struct(&mut self, name: &str, fields: &[(&str, &str)]) -> Option<&Type> {
         let mut new_struct = Struct {

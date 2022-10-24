@@ -1,7 +1,10 @@
 pub mod btf;
+pub mod traits;
 pub mod types;
 
 pub use crate::btf::*;
+pub use crate::traits::*;
+pub use crate::types::*;
 
 #[cfg(test)]
 mod tests {
