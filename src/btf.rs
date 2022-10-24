@@ -496,7 +496,7 @@ impl BtfTypes {
 
             types.push(new_type);
             if !raw_type.name.is_empty() {
-                name_map.insert(raw_type.name.clone(), id as u32);
+                name_map.insert(raw_type.name.clone(), id);
             }
         }
 
