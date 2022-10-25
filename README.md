@@ -1,28 +1,18 @@
-# BTF Parser
+# btf
+[![Build Status](https://github.com/arcjustin/btf/workflows/build/badge.svg)](https://github.com/arcjustin/btf/actions?query=workflow%3Abuild)
+[![crates.io](https://img.shields.io/crates/v/btf.svg)](https://crates.io/crates/btf)
+[![mio](https://docs.rs/btf/badge.svg)](https://docs.rs/btf/)
+[![Lines of Code](https://tokei.rs/b1/github/arcjustin/btf?category=code)](https://tokei.rs/b1/github/arcjustin/btf?category=code)
 
-## Description
 Parsing library for the eBPF type format.
 
-## Example Usage
-```rust
-use btf::BtfTypes;
-use btf::types::Type;
+## Usage
 
-let btf = BtfTypes::from_file("/sys/kernel/btf/vmlinux")?;
+For usage examples, see code located in [examples/](examples/) :
 
-if let Some(qt) = btf.resolve_type_by_name("do_mount") {
-    if let Type::FunctionProto(fp) = qt.base_type {
-        for param in fp.params {
-            println!("{:?}", param);
-        }
-    }
-}
+  | Examples | Description |
+  |----------|-------------|
+  |[print-type](examples/print-type.rs)| Prints a type given a path to a BTF file and a type name|
 
-if let Some(qt) = btf.resolve_type_by_name("task_struct") {
-    if let Type::Struct(st) = qt.base_type {
-        for member in st.members {
-            println!("{:?}", member);
-        }
-    }
-}
-```
+## TODO
+- Add proper errors.

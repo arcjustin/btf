@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build 
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest]
+        toolchain: [stable]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v3
+
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@v1.0.7
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+          components: rustfmt, clippy
+
+      - name: Check Code Format
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: fmt
+          args: -- --check
+
+      - name: Code Lint
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: clippy
+          args: --all-targets -- -D warnings
+
+      - name: Build
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: build
+
+      - name: Tests
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: test
+
+      - name: Examples
+        uses: actions-rs/cargo@v1.0.3
+        env:
+          RUST_LOG: "trace"
+        with:
+          command: run
+          args: --all-features --example print-type -- /sys/kernel/btf/vmlinux iovec
