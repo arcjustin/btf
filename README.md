@@ -16,3 +16,4 @@ For usage examples, see code located in [examples/](examples/) :
 
 ## TODO
 - Add proper errors.
+- Optimize / Reduce cloning 
