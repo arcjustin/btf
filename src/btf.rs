@@ -1,22 +1,22 @@
-use crate::types::*;
+use crate::{Error, Result};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::slice::Iter;
 
-#[derive(Debug)]
+/// Endian representation.
+#[derive(Clone, Copy, Debug, Default)]
 enum Endianess {
+    #[default]
     Big,
     Little,
 }
 
-#[derive(Debug)]
-struct BtfHeader {
-    endianess: Endianess,
+/// Represents a parsed BTF file header (struct btf_header).
+#[derive(Clone, Copy, Debug, Default)]
+struct Header {
     _version: u8,
     _flags: u8,
     hdr_len: u32,
@@ -26,15 +26,21 @@ struct BtfHeader {
     type_len: u32,
     str_off: u32,
     _str_len: u32,
+
+    endianess: Endianess,
 }
 
-impl BtfHeader {
-    fn read_with_order<B: ByteOrder, R: Read>(
+impl Header {
+    /// Parses a BTF header given an endianess.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the header is read.
+    /// * `endianess` - The endianess of the data; stored for parsing later on.
+    fn from_reader_with_order<B: ByteOrder, R: Read>(
         reader: &mut R,
         endianess: Endianess,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         Ok(Self {
-            endianess,
             _version: reader.read_u8()?,
             _flags: reader.read_u8()?,
             hdr_len: reader.read_u32::<B>()?,
@@ -42,798 +48,1044 @@ impl BtfHeader {
             type_len: reader.read_u32::<B>()?,
             str_off: reader.read_u32::<B>()?,
             _str_len: reader.read_u32::<B>()?,
+            endianess,
         })
     }
 
-    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
+    /// Parses a BTF header from an object that implements Read.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the header is read.
+    fn from_reader<R: Read + Seek + BufRead>(reader: &mut R) -> Result<Self> {
         let magic = reader.read_u16::<LittleEndian>()?;
         match magic {
-            0xeb9f => Self::read_with_order::<LittleEndian, _>(reader, Endianess::Little),
-            0x9feb => Self::read_with_order::<BigEndian, _>(reader, Endianess::Big),
-            _ => Err(Error::from(ErrorKind::InvalidData)),
+            0xeb9f => Self::from_reader_with_order::<LittleEndian, _>(reader, Endianess::Little),
+            0x9feb => Self::from_reader_with_order::<BigEndian, _>(reader, Endianess::Big),
+            _ => Err(Error::Parsing {
+                offset: reader.stream_position()?,
+                message: "Invalid magic value",
+            }),
         }
+    }
+
+    /// Read a string from the reader using the header as a reference.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the string is read.
+    /// * `offset` - The offset of the string.
+    fn read_string<R: Read + Seek + BufRead>(&self, reader: &mut R, offset: u32) -> Result<String> {
+        let oldpos = reader.stream_position()?;
+        reader.seek(SeekFrom::Start(
+            self.hdr_len as u64 + self.str_off as u64 + offset as u64,
+        ))?;
+
+        let mut raw_str = vec![];
+        reader.read_until(0, &mut raw_str)?;
+
+        match std::str::from_utf8(&raw_str) {
+            Ok(s) => {
+                if s.is_empty() {
+                    return Err(Error::Parsing {
+                        offset: reader.stream_position()?,
+                        message: "Found zero-sized string",
+                    });
+                }
+                reader.seek(SeekFrom::Start(oldpos))?;
+                Ok(String::from(&s[0..s.len() - 1]))
+            }
+            Err(_) => Err(Error::Parsing {
+                offset: reader.stream_position()?,
+                message: "Failed to decode string",
+            }),
+        }
+    }
+
+    /// Reads the type section of the BTF blob contained in reader.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the types are read.
+    fn read_types<R: Read + Seek + BufRead>(&self, reader: &mut R) -> Result<Vec<ParsedType>> {
+        reader.seek(SeekFrom::Start(self.hdr_len as u64 + self.type_off as u64))?;
+        let start_pos = reader.stream_position()?;
+        let end_pos = start_pos + self.type_len as u64;
+
+        let mut types = vec![ParsedType::default()];
+        loop {
+            let type_header = if matches!(self.endianess, Endianess::Little) {
+                TypeHeader::from_reader::<LittleEndian, _>(reader, self)?
+            } else {
+                TypeHeader::from_reader::<BigEndian, _>(reader, self)?
+            };
+            let ty = Type::from_reader(reader, &type_header, self)?;
+            types.push(ParsedType {
+                header: type_header,
+                ty,
+            });
+
+            match reader.stream_position()? {
+                pos if pos > end_pos => {
+                    return Err(Error::Parsing {
+                        offset: reader.stream_position()?,
+                        message: "Type length didn't match end of file",
+                    });
+                }
+                pos if pos == end_pos => break,
+                _ => (),
+            }
+        }
+
+        Ok(types)
     }
 }
 
-#[derive(Debug, Default)]
-struct BtfRawType {
-    id: u32,
-    name: String,
+/// All types representable by BTF.
+#[derive(Clone, Copy, Debug, Default)]
+enum TypeKind {
+    #[default]
+    Void,
+    Integer,
+    Pointer,
+    Array,
+    Struct,
+    Union,
+    Enum32,
+    Fwd,
+    Typedef,
+    Volatile,
+    Const,
+    Restrict,
+    Function,
+    FunctionProto,
+    Variable,
+    DataSection,
+    Float,
+    DeclTag,
+    TypeTag,
+    Enum64,
+}
+
+/// Represents a parsed BTF type header (struct type_header).
+#[derive(Clone, Debug, Default)]
+struct TypeHeader {
+    /// "name_off" parsed for convenience into a Rust String.
+    name: Option<String>,
+
+    /// "info" encoded bits.
+    ///
+    /// bits  0-15: vlen (e.g. # of struct's members)
+    /// bits 16-23: unused
+    /// bits 24-28: kind (e.g. int, ptr, array...etc)
+    /// bits 29-30: unused
+    /// bit     31: kind_flag, currently used by
+    ///             struct, union, fwd, enum and enum64.
+    ///
     info: u32,
+
+    /// "size"/"type" is a union field.
+    ///
+    /// "size" is used by INT, ENUM, STRUCT, UNION and ENUM64.
+    /// "size" tells the size of the type it is describing.
+    ///
+    /// "type" is used by PTR, TYPEDEF, VOLATILE, CONST, RESTRICT,
+    /// FUNC, FUNC_PROTO, DECL_TAG and TYPE_TAG.
+    /// "type" is a type_id referring to another type.
+    ///
     size_type: u32,
 }
 
-impl BtfRawType {
-    fn read_with_order<B: ByteOrder, R: Read + Seek + BufRead>(
-        id: u32,
+impl TypeHeader {
+    /// Parses a BTF type header. This is the C `struct bpf_type`, type.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the type is read.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
-        header: &BtfHeader,
-    ) -> Result<Self, Error> {
+        header: &Header,
+    ) -> Result<TypeHeader> {
         let name_off = reader.read_u32::<B>()?;
-        let name = read_string(reader, header, name_off)?;
+        let name = header.read_string(reader, name_off).ok();
         let info = reader.read_u32::<B>()?;
         let size_type = reader.read_u32::<B>()?;
 
         Ok(Self {
-            id,
             name,
             info,
             size_type,
         })
     }
 
-    fn read<R: Read + Seek + BufRead>(
-        id: u32,
-        reader: &mut R,
-        header: &BtfHeader,
-    ) -> Result<Self, Error> {
-        match header.endianess {
-            Endianess::Little => Self::read_with_order::<LittleEndian, _>(id, reader, header),
-            Endianess::Big => Self::read_with_order::<BigEndian, _>(id, reader, header),
+    /// Returns the kind field, see the documentation for this structure.
+    fn get_kind(&self) -> Result<TypeKind> {
+        match (self.info >> 24) & 0x1f {
+            x if x == TypeKind::Void as u32 => Ok(TypeKind::Void),
+            x if x == TypeKind::Integer as u32 => Ok(TypeKind::Integer),
+            x if x == TypeKind::Pointer as u32 => Ok(TypeKind::Pointer),
+            x if x == TypeKind::Array as u32 => Ok(TypeKind::Array),
+            x if x == TypeKind::Struct as u32 => Ok(TypeKind::Struct),
+            x if x == TypeKind::Union as u32 => Ok(TypeKind::Union),
+            x if x == TypeKind::Enum32 as u32 => Ok(TypeKind::Enum32),
+            x if x == TypeKind::Fwd as u32 => Ok(TypeKind::Fwd),
+            x if x == TypeKind::Typedef as u32 => Ok(TypeKind::Typedef),
+            x if x == TypeKind::Volatile as u32 => Ok(TypeKind::Volatile),
+            x if x == TypeKind::Const as u32 => Ok(TypeKind::Const),
+            x if x == TypeKind::Restrict as u32 => Ok(TypeKind::Restrict),
+            x if x == TypeKind::Function as u32 => Ok(TypeKind::Function),
+            x if x == TypeKind::FunctionProto as u32 => Ok(TypeKind::FunctionProto),
+            x if x == TypeKind::Variable as u32 => Ok(TypeKind::Variable),
+            x if x == TypeKind::DataSection as u32 => Ok(TypeKind::DataSection),
+            x if x == TypeKind::Float as u32 => Ok(TypeKind::Float),
+            x if x == TypeKind::DeclTag as u32 => Ok(TypeKind::DeclTag),
+            x if x == TypeKind::TypeTag as u32 => Ok(TypeKind::TypeTag),
+            x if x == TypeKind::Enum64 as u32 => Ok(TypeKind::Enum64),
+            x => Err(Error::UnknownType { type_num: x }),
         }
     }
 
+    /// Returns the vlen field, see the documentation for this structure.
     fn get_vlen(&self) -> u16 {
         self.info as u16
     }
 
-    fn get_kind(&self) -> Result<TypeKind, Error> {
-        let kind_val = (self.info >> 24) & 0x1f;
-        match kind_val {
-            0 => Ok(TypeKind::Void),
-            1 => Ok(TypeKind::Integer),
-            2 => Ok(TypeKind::Pointer),
-            3 => Ok(TypeKind::Array),
-            4 => Ok(TypeKind::Struct),
-            5 => Ok(TypeKind::Union),
-            6 => Ok(TypeKind::Enum32),
-            7 => Ok(TypeKind::Fwd),
-            8 => Ok(TypeKind::Typedef),
-            9 => Ok(TypeKind::Volatile),
-            10 => Ok(TypeKind::Const),
-            11 => Ok(TypeKind::Restrict),
-            12 => Ok(TypeKind::Function),
-            13 => Ok(TypeKind::FunctionProto),
-            14 => Ok(TypeKind::Variable),
-            15 => Ok(TypeKind::DataSection),
-            16 => Ok(TypeKind::Float),
-            17 => Ok(TypeKind::DeclTag),
-            18 => Ok(TypeKind::TypeTag),
-            19 => Ok(TypeKind::Enum64),
-            _ => Err(Error::from(ErrorKind::InvalidData)),
-        }
-    }
-
+    /// Returns the kind flag, see the documentation for this structure.
     fn get_kind_flag(&self) -> bool {
         ((self.info >> 31) & 0x1) == 0x1
     }
 
+    /// Returns the type, see the documentation for this structure.
     fn get_type(&self) -> u32 {
         self.size_type
     }
 
+    /// Returns the size, see the documentation for this structure.
     fn get_size(&self) -> u32 {
         self.size_type
     }
 }
 
-fn read_string<R: Read + Seek + BufRead>(
-    reader: &mut R,
-    header: &BtfHeader,
-    offset: u32,
-) -> Result<String, Error> {
-    let oldpos = reader.stream_position()?;
-    reader.seek(SeekFrom::Start(
-        header.hdr_len as u64 + header.str_off as u64 + offset as u64,
-    ))?;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Integer {
+    pub used_bits: u32,
+    pub bits: u32,
+    pub is_signed: bool,
+    pub is_char: bool,
+    pub is_bool: bool,
+}
 
-    let mut raw_str = vec![];
-    reader.read_until(0, &mut raw_str)?;
+impl Integer {
+    /// Reads a BTF encoded integer (BTF_KIND_INT).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_reader<B: ByteOrder, R: Read>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+    ) -> Result<Self> {
+        let kind_specific = reader.read_u32::<B>()?;
+        let bits = kind_specific as u8;
+        let is_signed = (kind_specific >> 24) & 0x1 == 0x1;
+        let is_char = (kind_specific >> 24) & 0x2 == 0x2;
+        let is_bool = (kind_specific >> 24) & 0x4 == 0x4;
+        Ok(Self {
+            bits: type_header.size_type * 8,
+            used_bits: bits.into(),
+            is_signed,
+            is_char,
+            is_bool,
+        })
+    }
+}
 
-    match std::str::from_utf8(&raw_str) {
-        Ok(s) => {
-            if s.is_empty() {
-                return Err(Error::from(ErrorKind::InvalidData));
-            }
-            reader.seek(SeekFrom::Start(oldpos))?;
-            Ok(String::from(&s[0..s.len() - 1]))
+/// There are multiple BTF types that simply map to other types like:
+/// Pointer, Typedef, etc.. This is used to represent those mappings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TypeMap {
+    pub type_id: u32,
+}
+
+impl TypeMap {
+    /// Creates a type map from a given BTF type header.
+    ///
+    /// # Arguments
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_type_header(type_header: &TypeHeader) -> Self {
+        Self {
+            type_id: type_header.get_type(),
         }
-        Err(_) => Err(Error::from(ErrorKind::InvalidData)),
     }
 }
 
-fn read_integer<B: ByteOrder, R: Read + Seek>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<Type, Error> {
-    let info = reader.read_u32::<B>()?;
-    let name = raw_type.name.clone();
-    let bits = info as u8;
-    let is_signed = (info >> 24) & 0x1 == 0x1;
-    let is_char = (info >> 24) & 0x2 == 0x2;
-    let is_bool = (info >> 24) & 0x4 == 0x4;
-    let offset = ((info >> 16) & 0xffff) as u16;
-    Ok(Type::Integer(Integer {
-        id: raw_type.id,
-        name,
-        size: raw_type.get_size(),
-        bits,
-        is_signed,
-        is_char,
-        is_bool,
-        offset,
-    }))
+/// Represents a parsed BTF array (struct btf_array).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Array {
+    pub elem_type_id: u32,
+    pub index_type_id: u32,
+    pub num_elements: u32,
 }
 
-fn create_type_map(raw_type: &BtfRawType) -> TypeMap {
-    TypeMap {
-        id: raw_type.id,
-        type_id: raw_type.get_type(),
+impl Array {
+    /// Reads a BTF encoded array (struct btf_array).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+        Ok(Self {
+            elem_type_id: reader.read_u32::<B>()?,
+            index_type_id: reader.read_u32::<B>()?,
+            num_elements: reader.read_u32::<B>()?,
+        })
     }
 }
 
-fn read_array<B: ByteOrder, R: Read + Seek>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<Type, Error> {
-    Ok(Type::Array(Array {
-        id: raw_type.id,
-        size: 0,
-        element_type: reader.read_u32::<B>()?,
-        index_type: reader.read_u32::<B>()?,
-        num_elements: reader.read_u32::<B>()?,
-    }))
+/// Represents a parsed BTF structure member (struct btf_member).
+#[derive(Clone, Debug, Default)]
+pub struct StructMember {
+    pub name: String,
+    pub type_id: u32,
+    pub offset: u32,
+    pub bits: Option<u32>,
 }
 
-fn read_struct_member<B: ByteOrder, R: Read + Seek + BufRead>(
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<StructMember, Error> {
-    let name_off = reader.read_u32::<B>()?;
-    let name = read_string(reader, header, name_off)?;
-    let type_id = reader.read_u32::<B>()?;
-    let bitfield_size_offset = reader.read_u32::<B>()?;
+impl StructMember {
+    /// Reads a BTF encoded structure member (struct btf_member).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<StructMember> {
+        let name_off = reader.read_u32::<B>()?;
+        let name = header.read_string(reader, name_off)?;
+        let type_id = reader.read_u32::<B>()?;
+        let offset_and_bits = reader.read_u32::<B>()?;
 
-    Ok(StructMember {
-        name,
-        type_id,
-        bitfield_size: bitfield_size_offset >> 24,
-        offset: bitfield_size_offset & 0xffffff,
-    })
-}
+        let (offset, bits) = if type_header.get_kind_flag() {
+            (offset_and_bits & 0xffffff, Some(offset_and_bits >> 24))
+        } else {
+            (offset_and_bits, None)
+        };
 
-fn read_struct<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<Type, Error> {
-    let mut members = HashMap::<String, StructMember>::with_capacity(raw_type.get_vlen().into());
-    for _ in 0..raw_type.get_vlen() {
-        let member = read_struct_member::<B, _>(reader, header)?;
-        members.insert(member.name.clone(), member);
-    }
-
-    Ok(Type::Struct(Struct {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        size: raw_type.get_size(),
-        members,
-    }))
-}
-
-fn read_union<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<Type, Error> {
-    let num_members = raw_type.get_vlen() as usize;
-    let mut members = HashMap::<String, StructMember>::with_capacity(num_members);
-    for _ in 0..num_members {
-        let member = read_struct_member::<B, _>(reader, header)?;
-        members.insert(member.name.clone(), member);
-    }
-
-    Ok(Type::Union(Struct {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        size: raw_type.get_size(),
-        members,
-    }))
-}
-
-fn read_enum_entry<B: ByteOrder, R: Read + Seek + BufRead>(
-    reader: &mut R,
-    header: &BtfHeader,
-    is_64b: bool,
-) -> Result<EnumEntry, Error> {
-    let name_off = reader.read_u32::<B>()?;
-    let name = read_string(reader, header, name_off)?;
-    let value = if is_64b {
-        reader.read_i32::<B>()? as i64 | ((reader.read_i32::<B>()? as i64) << 32)
-    } else {
-        reader.read_i32::<B>()? as i64
-    };
-
-    Ok(EnumEntry { name, value })
-}
-
-fn read_enum<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<Type, Error> {
-    let is_64b = match raw_type.get_kind() {
-        Ok(TypeKind::Enum32) => false,
-        Ok(TypeKind::Enum64) => true,
-        _ => return Err(Error::from(ErrorKind::InvalidData)),
-    };
-
-    let mut entries = HashMap::<String, EnumEntry>::with_capacity(raw_type.get_vlen().into());
-    for _ in 0..raw_type.get_vlen() {
-        let entry = read_enum_entry::<B, _>(reader, header, is_64b)?;
-        entries.insert(entry.name.clone(), entry);
-    }
-
-    if is_64b {
-        Ok(Type::Enum64(Enum {
-            id: raw_type.id,
-            name: raw_type.name.clone(),
-            size: (8 * raw_type.get_vlen()) as u32,
-            entries,
-        }))
-    } else {
-        Ok(Type::Enum32(Enum {
-            id: raw_type.id,
-            name: raw_type.name.clone(),
-            size: (4 * raw_type.get_vlen()) as u32,
-            entries,
-        }))
+        Ok(StructMember {
+            name,
+            type_id,
+            offset,
+            bits,
+        })
     }
 }
 
-fn create_fwd(raw_type: &BtfRawType) -> Type {
-    Type::Fwd(Fwd {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        is_union: raw_type.get_kind_flag(),
-    })
+/// Represents a parsed BTF structure ([struct btf_member]).
+#[derive(Clone, Debug, Default)]
+pub struct Struct {
+    pub members: Vec<StructMember>,
 }
 
-fn create_typedef(raw_type: &BtfRawType) -> Type {
-    Type::Typedef(Typedef {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        type_id: raw_type.get_type(),
-    })
+impl Struct {
+    /// Reads a BTF encoded structure ([struct btf_member]).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<Self> {
+        let num_members = type_header.get_vlen();
+        let mut members = Vec::<StructMember>::with_capacity(num_members.into());
+        for _ in 0..num_members {
+            members.push(StructMember::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?);
+        }
+
+        Ok(Struct { members })
+    }
 }
 
-fn create_function(raw_type: &BtfRawType) -> Result<Type, Error> {
-    let linkage = match raw_type.get_vlen() {
-        0 => LinkageKind::Static,
-        1 => LinkageKind::Global,
-        _ => return Err(Error::from(ErrorKind::InvalidData)),
-    };
-
-    Ok(Type::Function(Function {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        linkage,
-        type_id: raw_type.get_type(),
-    }))
+/// Represents a parsed BTF enum member (struct btf_enum).
+#[derive(Clone, Debug, Default)]
+pub struct EnumEntry {
+    pub name: String,
+    pub value: i64,
 }
 
-fn read_function_param<B: ByteOrder, R: Read + Seek + BufRead>(
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<FunctionParam, Error> {
-    let name_off = reader.read_u32::<B>()?;
-    let name = read_string(reader, header, name_off)?;
-    let type_id = reader.read_u32::<B>()?;
+impl EnumEntry {
+    /// Reads a BTF encoded enum member (struct btf_enum).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead, const WIDE: bool>(
+        reader: &mut R,
+        header: &Header,
+    ) -> Result<Self> {
+        let name_off = reader.read_u32::<B>()?;
+        let name = header.read_string(reader, name_off)?;
+        let value = if WIDE {
+            reader.read_i32::<B>()? as i64 | ((reader.read_i32::<B>()? as i64) << 32)
+        } else {
+            reader.read_i32::<B>()? as i64
+        };
 
-    Ok(FunctionParam { name, type_id })
+        Ok(EnumEntry { name, value })
+    }
 }
 
-fn read_function_proto<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-    header: &BtfHeader,
-) -> Result<Type, Error> {
-    let mut params: Vec<FunctionParam> = vec![];
-    for _ in 0..raw_type.get_vlen() {
-        let param = read_function_param::<B, _>(reader, header)?;
-        params.push(param);
+/// Represents a parsed BTF enum ([struct btf_enum]).
+#[derive(Clone, Debug, Default)]
+pub struct Enum {
+    pub is_signed: bool,
+    pub entries: Vec<EnumEntry>,
+}
+
+impl Enum {
+    /// Reads a BTF encoded enum member ([struct btf_enum]).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<Self> {
+        let is_signed = type_header.get_kind_flag();
+        let num_entries = type_header.get_vlen();
+        let mut entries = Vec::<EnumEntry>::with_capacity(num_entries.into());
+        match type_header.get_kind() {
+            Ok(TypeKind::Enum32) => {
+                for _ in 0..num_entries {
+                    entries.push(EnumEntry::from_reader::<B, _, false>(reader, header)?);
+                }
+            }
+            Ok(TypeKind::Enum64) => {
+                for _ in 0..num_entries {
+                    entries.push(EnumEntry::from_reader::<B, _, true>(reader, header)?);
+                }
+            }
+            _ => return Err(Error::InvalidEnumTypeKind),
+        };
+
+        Ok(Self { is_signed, entries })
+    }
+}
+
+/// Represents a parsed BTF forward-declaration.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Fwd {
+    #[default]
+    Struct,
+    Union,
+}
+
+impl Fwd {
+    /// Creates a forward-declaration type from a BTF type header.
+    ///
+    /// # Arguments
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_type_header(type_header: &TypeHeader) -> Self {
+        if type_header.get_kind_flag() {
+            Self::Union
+        } else {
+            Self::Struct
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum LinkageKind {
+    #[default]
+    Static,
+    Global,
+}
+
+/// Represents a parsed BTF function.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Function {
+    pub linkage: LinkageKind,
+    pub type_id: u32,
+}
+
+impl Function {
+    /// Creates a function type from a raw type header.
+    ///
+    /// # Arguments
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_type_header(type_header: &TypeHeader) -> Self {
+        let linkage = if type_header.get_vlen() == 0 {
+            LinkageKind::Static
+        } else {
+            LinkageKind::Global
+        };
+
+        Self {
+            linkage,
+            type_id: type_header.get_type(),
+        }
+    }
+}
+
+/// Represents a parsed BTF function parameter (struct btf_param).
+#[derive(Clone, Debug, Default)]
+pub struct FunctionParam {
+    pub name: String,
+    pub type_id: u32,
+}
+
+impl FunctionParam {
+    /// Reads a BTF encoded function parameter (struct btf_param).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        header: &Header,
+    ) -> Result<Self> {
+        let name_off = reader.read_u32::<B>()?;
+        let name = header.read_string(reader, name_off)?;
+        let type_id = reader.read_u32::<B>()?;
+
+        Ok(Self { name, type_id })
+    }
+}
+
+/// Represents a parsed BTF function prototype ([struct btf_param]).
+#[derive(Clone, Debug, Default)]
+pub struct FunctionProto {
+    pub params: Vec<FunctionParam>,
+}
+
+impl FunctionProto {
+    /// Reads a BTF encoded function ([struct btf_param]).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<Self> {
+        let num_params = type_header.get_vlen();
+        let mut params = Vec::with_capacity(num_params.into());
+        for _ in 0..num_params {
+            params.push(FunctionParam::from_reader::<B, _>(reader, header)?);
+        }
+
+        Ok(Self { params })
+    }
+}
+
+/// Represents a parsed BTF variable type (struct btf_var).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Variable {
+    pub linkage: LinkageKind,
+}
+
+impl Variable {
+    /// Reads a BTF encoded variable (struct btf_var).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+        let linkage = match reader.read_u32::<B>()? {
+            0 => LinkageKind::Static,
+            1 => LinkageKind::Global,
+            _ => return Err(Error::InvalidLinkageKind),
+        };
+
+        Ok(Self { linkage })
+    }
+}
+
+/// Represents a parsed BTF section variable (struct btf_var_secinfo).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SectionVariable {
+    pub type_id: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+impl SectionVariable {
+    /// Reads a BTF encoded section variable (struct btf_var_secinfo).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+        Ok(Self {
+            type_id: reader.read_u32::<B>()?,
+            offset: reader.read_u32::<B>()?,
+            size: reader.read_u32::<B>()?,
+        })
+    }
+}
+
+/// Represents a parsed BTF data section ([struct btf_var_secinfo]).
+#[derive(Clone, Debug, Default)]
+pub struct DataSection {
+    pub vars: Vec<SectionVariable>,
+}
+
+impl DataSection {
+    /// Reads a BTF encoded data section ([struct btf_var_secinfo]).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_reader<B: ByteOrder, R: Read>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+    ) -> Result<Self> {
+        let num_vars = type_header.get_vlen();
+        let mut vars = Vec::with_capacity(num_vars.into());
+        for _ in 0..num_vars {
+            vars.push(SectionVariable::from_reader::<B, _>(reader)?)
+        }
+
+        Ok(Self { vars })
+    }
+}
+
+/// Represents a parsed BTF float.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Float {
+    pub bits: u32,
+}
+
+impl Float {
+    /// Creates a float type from a raw type header.
+    ///
+    /// # Arguments
+    /// * `type_header` - The BTF type header that was read for this type.
+    fn from_type_header(type_header: &TypeHeader) -> Self {
+        Self {
+            bits: type_header.get_size() * 8,
+        }
+    }
+}
+
+/// Represents a parsed BTF decl tag.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeclTag {
+    pub component_index: u32,
+}
+
+impl DeclTag {
+    /// Reads a BTF encoded decl tag (struct btf_decl_tag).
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+        Ok(Self {
+            component_index: reader.read_u32::<B>()?,
+        })
+    }
+}
+
+/// Represents a parsed BTF type.
+#[derive(Clone, Debug, Default)]
+pub enum Type {
+    #[default]
+    Void,
+    Integer(Integer),
+    Pointer(TypeMap),
+    Array(Array),
+    Struct(Struct),
+    Union(Struct),
+    Enum32(Enum),
+    Fwd(Fwd),
+    Typedef(TypeMap),
+    Volatile(TypeMap),
+    Const(TypeMap),
+    Restrict(TypeMap),
+    Function(Function),
+    FunctionProto(FunctionProto),
+    Variable(Variable),
+    DataSection(DataSection),
+    Float(Float),
+    DeclTag(DeclTag),
+    TypeTag(TypeMap),
+    Enum64(Enum),
+}
+
+impl Type {
+    /// Called from `from_reader` with the appropriate endianess.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader_with_order<B: ByteOrder, R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<Self> {
+        match type_header.get_kind()? {
+            TypeKind::Void => Ok(Self::Void),
+            TypeKind::Integer => Ok(Self::Integer(Integer::from_reader::<B, _>(
+                reader,
+                type_header,
+            )?)),
+            TypeKind::Pointer => Ok(Self::Pointer(TypeMap::from_type_header(type_header))),
+            TypeKind::Array => Ok(Self::Array(Array::from_reader::<B, _>(reader)?)),
+            TypeKind::Struct => Ok(Self::Struct(Struct::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?)),
+            TypeKind::Union => Ok(Self::Struct(Struct::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?)),
+            TypeKind::Enum32 => Ok(Self::Enum32(Enum::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?)),
+            TypeKind::Fwd => Ok(Self::Fwd(Fwd::from_type_header(type_header))),
+            TypeKind::Typedef => Ok(Self::Typedef(TypeMap::from_type_header(type_header))),
+            TypeKind::Volatile => Ok(Self::Volatile(TypeMap::from_type_header(type_header))),
+            TypeKind::Const => Ok(Self::Const(TypeMap::from_type_header(type_header))),
+            TypeKind::Restrict => Ok(Self::Restrict(TypeMap::from_type_header(type_header))),
+            TypeKind::Function => Ok(Self::Function(Function::from_type_header(type_header))),
+            TypeKind::FunctionProto => Ok(Self::FunctionProto(FunctionProto::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?)),
+            TypeKind::Variable => Ok(Self::Variable(Variable::from_reader::<B, _>(reader)?)),
+            TypeKind::DataSection => Ok(Self::DataSection(DataSection::from_reader::<B, _>(
+                reader,
+                type_header,
+            )?)),
+            TypeKind::Float => Ok(Self::Float(Float::from_type_header(type_header))),
+            TypeKind::DeclTag => Ok(Self::DeclTag(DeclTag::from_reader::<B, _>(reader)?)),
+            TypeKind::TypeTag => Ok(Self::TypeTag(TypeMap::from_type_header(type_header))),
+            TypeKind::Enum64 => Ok(Self::Enum64(Enum::from_reader::<B, _>(
+                reader,
+                type_header,
+                header,
+            )?)),
+        }
     }
 
-    Ok(Type::FunctionProto(FunctionProto {
-        id: raw_type.id,
-        params,
-    }))
+    /// Reads types that follow the BTF header. Consumes a variable number of bytes from the
+    /// reader depending on the type that is read.
+    ///
+    /// # Arguments
+    /// * `reader` - The reader from which the integer is read.
+    /// * `type_header` - The BTF type header that was read for this type.
+    /// * `header` - The header associated with this type.
+    fn from_reader<R: Read + Seek + BufRead>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+        header: &Header,
+    ) -> Result<Self> {
+        match header.endianess {
+            Endianess::Little => {
+                Self::from_reader_with_order::<LittleEndian, _>(reader, type_header, header)
+            }
+            Endianess::Big => {
+                Self::from_reader_with_order::<BigEndian, _>(reader, type_header, header)
+            }
+        }
+    }
 }
 
-fn read_variable<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<Type, Error> {
-    let linkage = match reader.read_u32::<B>()? {
-        0 => LinkageKind::Static,
-        1 => LinkageKind::Global,
-        _ => return Err(Error::from(ErrorKind::InvalidData)),
-    };
-
-    Ok(Type::Variable(Variable {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        linkage,
-    }))
+/// Represents a single parsed BTF type, that is, the common header and
+/// type-specific information.
+#[derive(Clone, Debug, Default)]
+struct ParsedType {
+    header: TypeHeader,
+    ty: Type,
 }
 
-fn read_section_info<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<SectionInfo, Error> {
-    Ok(SectionInfo {
-        id: raw_type.id,
-        type_id: reader.read_u32::<B>()?,
-        offset: reader.read_u32::<B>()?,
-        size: reader.read_u32::<B>()?,
-    })
+/// A type that's been resolved to its base type with attributes as fields.
+#[derive(Clone, Debug, Default)]
+pub struct FlattenedType {
+    pub type_id: u32,
+    pub bits: u32,
+    pub base_type: Type,
+    pub num_refs: u32,
+    pub names: Vec<String>,
+    pub tags: Vec<String>,
+    pub is_volatile: bool,
+    pub is_const: bool,
+    pub is_restrict: bool,
+    pub is_function: bool,
 }
 
-fn read_data_section<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<Type, Error> {
-    let mut sections: Vec<SectionInfo> = vec![];
-    for _ in 0..raw_type.get_vlen() {
-        let section = read_section_info::<B, _>(raw_type, reader)?;
-        sections.push(section);
+impl FlattenedType {
+    const MAX_INDIRECTIONS: usize = 100;
+
+    /// Helper for finding the total size of a parsed type.
+    fn get_parsed_type_bits(types: &[ParsedType], id: u32, mut indirections: usize) -> Result<u32> {
+        indirections += 1;
+        if indirections == Self::MAX_INDIRECTIONS {
+            return Err(Error::TypeLoop);
+        }
+
+        let flattened_type = Self::from_parsed_types(types, id)?;
+        if flattened_type.num_refs > 0 {
+            return Ok(64); // Treat all pointers as 64 bits for now.
+        }
+
+        let bits = match flattened_type.base_type {
+            Type::Integer(t) => t.bits,
+            Type::Array(t) => {
+                let element_bits = Self::get_parsed_type_bits(types, t.elem_type_id, indirections)?;
+                t.num_elements * element_bits
+            }
+            Type::Struct(t) | Type::Union(t) => {
+                let mut bits = 0;
+                for member in &t.members {
+                    let member_bits =
+                        Self::get_parsed_type_bits(types, member.type_id, indirections)?;
+                    if member.offset + member_bits > bits {
+                        bits = member.offset + member_bits;
+                    }
+                }
+                bits
+            }
+            Type::Enum32(_) => 32,
+            Type::Enum64(_) => 64,
+            Type::DataSection(t) => {
+                let mut bits = 0;
+                for vars in &t.vars {
+                    if vars.offset + vars.size * 8 > bits {
+                        bits = vars.offset + vars.size * 8;
+                    }
+                }
+                bits
+            }
+            Type::Void | Type::Fwd(_) | Type::FunctionProto(_) => 0,
+            Type::Float(t) => t.bits,
+            _ => {
+                return Err(Error::InternalError {
+                    message: "FlattenedType has non base type.",
+                })
+            }
+        };
+
+        Ok(bits)
     }
 
-    Ok(Type::DataSection(DataSection {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        sections,
-    }))
+    /// Flattens a type by its type id. Since BTF types are chained together,
+    /// the type info needs to be traversed to find the base type. This function
+    /// traverses the function, starting at `id` and returns the base type.
+    ///
+    /// # Arguments
+    ///
+    /// * `types` - The array of parsed types where index is the type id.
+    /// * `id` - The id of the type to flatten.
+    fn from_parsed_types(types: &[ParsedType], id: u32) -> Result<Self> {
+        let mut index: usize = id.try_into()?;
+        let mut num_refs = 0;
+        let mut names = vec![];
+        let mut tags = vec![];
+        let mut is_volatile = false;
+        let mut is_const = false;
+        let mut is_restrict = false;
+        let mut is_function = false;
+        let mut base_type: &Type;
+
+        let mut i = 0;
+        loop {
+            // Prevent type loops.
+            i += 1;
+            if i == Self::MAX_INDIRECTIONS {
+                return Err(Error::TypeLoop);
+            }
+
+            let ty = types.get(index).ok_or(Error::InvalidTypeIndex)?;
+            base_type = &ty.ty;
+            match base_type {
+                Type::Integer(_)
+                | Type::Struct(_)
+                | Type::Union(_)
+                | Type::Enum32(_)
+                | Type::Enum64(_)
+                | Type::Fwd(_)
+                | Type::DataSection(_)
+                | Type::Float(_) => {
+                    if let Some(name) = &ty.header.name {
+                        if i == 1 {
+                            names.push(name.clone());
+                        }
+                    }
+                    break;
+                }
+                Type::Pointer(t) => {
+                    num_refs += 1;
+                    index = t.type_id.try_into()?;
+                }
+                Type::Typedef(t) => {
+                    if let Some(name) = &ty.header.name {
+                        names.push(name.clone());
+                    }
+                    index = t.type_id.try_into()?;
+                }
+                Type::Volatile(t) => {
+                    is_volatile = true;
+                    index = t.type_id.try_into()?;
+                }
+                Type::Const(t) => {
+                    is_const = true;
+                    index = t.type_id.try_into()?;
+                }
+                Type::Restrict(t) => {
+                    is_restrict = true;
+                    index = t.type_id.try_into()?;
+                }
+                Type::Function(t) => {
+                    if let Some(name) = &ty.header.name {
+                        names.push(name.clone());
+                    }
+                    is_function = true;
+                    index = t.type_id.try_into()?;
+                }
+                Type::TypeTag(t) => {
+                    if let Some(name) = &ty.header.name {
+                        tags.push(name.clone());
+                    }
+                    index = t.type_id.try_into()?;
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Self {
+            type_id: id,
+            bits: 0,
+            base_type: base_type.clone(),
+            num_refs,
+            names,
+            tags,
+            is_volatile,
+            is_const,
+            is_restrict,
+            is_function,
+        })
+    }
 }
 
-fn create_float(raw_type: &BtfRawType) -> Type {
-    Type::Float(Float {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        size: raw_type.get_size(),
-    })
-}
-
-fn read_decl_tag<B: ByteOrder, R: Read + Seek + BufRead>(
-    raw_type: &BtfRawType,
-    reader: &mut R,
-) -> Result<Type, Error> {
-    Ok(Type::DeclTag(DeclTag {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-        component_index: reader.read_u32::<B>()?,
-    }))
-}
-
-fn create_type_tag(raw_type: &BtfRawType) -> Type {
-    Type::TypeTag(TypeTag {
-        id: raw_type.id,
-        name: raw_type.name.clone(),
-    })
-}
-
-#[derive(Default)]
-pub struct BtfTypes {
-    types: Vec<Type>,
+/// Represents a deserialized BTF file.
+#[derive(Clone, Debug, Default)]
+pub struct Btf {
+    types: Vec<FlattenedType>,
     name_map: HashMap<String, u32>,
 }
 
-impl BtfTypes {
-    fn read_with_order<B: ByteOrder, R: Read + Seek + BufRead>(
-        reader: &mut R,
-        header: &BtfHeader,
-    ) -> Result<Self, Error> {
-        let type_start = header.hdr_len as u64 + header.type_off as u64;
-        let type_end = type_start + header.type_len as u64;
-        reader.seek(SeekFrom::Start(type_start))?;
-
-        let mut types = vec![Type::Void];
-        let mut name_map = HashMap::new();
-
-        loop {
-            match reader.stream_position()? {
-                n if n == type_end => break,
-                n if n > type_end => return Err(Error::from(ErrorKind::InvalidData)),
-                _ => (),
-            }
-
-            let id = types.len() as u32;
-            let raw_type = BtfRawType::read(id, reader, header)?;
-            let kind = raw_type.get_kind()?;
-
-            let new_type = match kind {
-                TypeKind::Void => return Err(Error::from(ErrorKind::InvalidData)),
-                TypeKind::Integer => read_integer::<B, _>(&raw_type, reader)?,
-                TypeKind::Pointer => Type::Pointer(create_type_map(&raw_type)),
-                TypeKind::Array => read_array::<B, _>(&raw_type, reader)?,
-                TypeKind::Struct => read_struct::<B, _>(&raw_type, reader, header)?,
-                TypeKind::Union => read_union::<B, _>(&raw_type, reader, header)?,
-                TypeKind::Enum32 => read_enum::<B, _>(&raw_type, reader, header)?,
-                TypeKind::Fwd => create_fwd(&raw_type),
-                TypeKind::Typedef => create_typedef(&raw_type),
-                TypeKind::Volatile => Type::Volatile(create_type_map(&raw_type)),
-                TypeKind::Const => Type::Const(create_type_map(&raw_type)),
-                TypeKind::Restrict => Type::Restrict(create_type_map(&raw_type)),
-                TypeKind::Function => create_function(&raw_type)?,
-                TypeKind::FunctionProto => read_function_proto::<B, _>(&raw_type, reader, header)?,
-                TypeKind::Variable => read_variable::<B, _>(&raw_type, reader)?,
-                TypeKind::DataSection => read_data_section::<B, _>(&raw_type, reader)?,
-                TypeKind::Float => create_float(&raw_type),
-                TypeKind::DeclTag => read_decl_tag::<B, _>(&raw_type, reader)?,
-                TypeKind::TypeTag => create_type_tag(&raw_type),
-                TypeKind::Enum64 => read_enum::<B, _>(&raw_type, reader, header)?,
-            };
-
-            types.push(new_type);
-            if !raw_type.name.is_empty() {
-                name_map.insert(raw_type.name.clone(), id);
-            }
-        }
-
-        let mut btf = Self { types, name_map };
-
-        /* resolve all array sizes */
-        let mut array_sizes = HashMap::new();
-        for t in &btf.types {
-            if let Type::Array(a) = t {
-                if let Some(qtype) = btf.resolve_type_by_id(a.element_type) {
-                    let sz = qtype.get_size() * a.num_elements;
-                    array_sizes.insert(a.id, sz);
-                }
-            }
-        }
-
-        for (id, sz) in &array_sizes {
-            if let Some(Type::Array(a)) = btf.types.get_mut(*id as usize) {
-                a.size = *sz;
-            }
-        }
-
-        Ok(btf)
-    }
-
-    /// Parses a file containing raw BTF data and returns a BtfType database.
+impl Btf {
+    /// Parses a BTF file into a vector of types.
     ///
     /// # Arguments
     ///
     /// * `path` - The path to the BTF file.
     ///
-    /// # Examples
-    ///
+    /// # Example
     /// ```
-    /// use btf::BtfTypes;
+    /// use btf::btf::Btf;
     ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux");
+    /// let btf = Btf::from_file("/sys/kernel/btf/vmlinux").expect("failed to parse btf");
     /// ```
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let mut reader = match File::open(path) {
-            Ok(file) => BufReader::new(file),
-            Err(e) => return Err(e),
-        };
-
-        let header = match BtfHeader::read(&mut reader) {
-            Ok(header) => header,
-            Err(e) => return Err(e),
-        };
-
-        let r = match header.endianess {
-            Endianess::Little => Self::read_with_order::<LittleEndian, _>(&mut reader, &header),
-            Endianess::Big => Self::read_with_order::<BigEndian, _>(&mut reader, &header),
-        };
-
-        match r {
-            Ok(s) => Ok(s),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Returns a type from a type identifier.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The id of the type to search for.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use btf::BtfTypes;
-    ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// let first_type = vmlinux_types.get_type_by_id(1).unwrap();
-    /// ```
-    pub fn get_type_by_id(&self, id: u32) -> Option<&Type> {
-        if id as usize >= self.types.len() {
-            None
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        /*
+         * Arbitrary threshold of 50 MB to limit memory usage when parsing. If the
+         * file is over 50MB the file is used to seek/parse, otherwise all data is
+         * read into memory and then parsed. The latter is much quicker.
+         */
+        let meta = std::fs::metadata(&path)?;
+        let types = if meta.len() > 50 << 20 {
+            let mut reader = BufReader::new(std::fs::File::open(&path)?);
+            let header = Header::from_reader(&mut reader)?;
+            header.read_types(&mut reader)?
         } else {
-            Some(&self.types[id as usize])
-        }
-    }
+            let data = std::fs::read(path)?;
+            let mut reader = Cursor::new(data);
+            let header = Header::from_reader(&mut reader)?;
+            header.read_types(&mut reader)?
+        };
 
-    /// Returns a type given a name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the type to search for.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use btf::BtfTypes;
-    ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// let task_struct = vmlinux_types.get_type_by_name("task_struct").unwrap();
-    /// ```
-    pub fn get_type_by_name(&self, name: &str) -> Option<&Type> {
-        match self.name_map.get(name) {
-            Some(id) => self.get_type_by_id(*id),
-            None => None,
-        }
-    }
-
-    /// Returns an iterator that can be used to iterate all the types contained
-    /// within the parsed BTF database.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use btf::BtfTypes;
-    ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// ```
-    pub fn iter(&self) -> Iter<Type> {
-        self.types.iter()
-    }
-
-    /// Returns a fully qualified type given the type identifier. Types that contain
-    /// qualifiers or are pointers are represented as linked types, for example, a
-    /// type that's a typedef to a pointer, like `typedef int *a;` could be represented
-    /// as: `Typedef(id=1, tid=2) -> Pointer(id=2, tid=3) -> Integer(id=3, ...)`. this
-    /// function flattens the link into a single type to make it easier for users.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The id of the type to search for.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use btf::BtfTypes;
-    ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// let first_type = vmlinux_types.resolve_type_by_id(1).unwrap();
-    /// if first_type.is_volatile {
-    ///     /* this type is volatile */
-    /// }
-    /// ```
-    pub fn resolve_type_by_id(&self, mut type_id: u32) -> Option<QualifiedType> {
-        let mut qualified_type = QualifiedType::default();
-
-        loop {
-            let btf_type = self.get_type_by_id(type_id)?;
-
-            type_id = match btf_type {
-                Type::Pointer(ptr) => {
-                    qualified_type.num_refs += 1;
-                    ptr.type_id
-                }
-                Type::Typedef(def) => {
-                    qualified_type.is_typedef = true;
-                    def.type_id
-                }
-                Type::Volatile(map) => {
-                    qualified_type.is_volatile = true;
-                    map.type_id
-                }
-                Type::Const(map) => {
-                    qualified_type.is_constant = true;
-                    map.type_id
-                }
-                Type::Restrict(map) => {
-                    qualified_type.is_restrict = true;
-                    map.type_id
-                }
-                Type::Function(func) => {
-                    qualified_type.is_function = true;
-                    func.type_id
-                }
-                _ => {
-                    qualified_type.base_type = btf_type.clone();
-                    return Some(qualified_type);
-                }
+        let mut name_map = HashMap::default();
+        let mut flattened_types = vec![];
+        for id in 0..types.len() {
+            let index = id.try_into()?;
+            let mut flattened_type = FlattenedType::from_parsed_types(&types, index)?;
+            flattened_type.bits = FlattenedType::get_parsed_type_bits(&types, index, 0)?;
+            for name in &flattened_type.names {
+                name_map.insert(name.clone(), index);
             }
+            flattened_types.push(flattened_type);
         }
+
+        Ok(Btf {
+            types: flattened_types,
+            name_map,
+        })
     }
 
-    /// Returns a fully qualified type given the type name. BTF represents types by
-    /// linking various type ids together, for example, a type that's typedefed to a
-    /// pointer, like `typedef int *a;` could be represented as:
-    ///
-    /// `Typedef(id=1, tid=2) -> Pointer(id=2, tid=3) -> Integer(id=3, ...)`.
-    ///
-    /// This function flattens the links into a single type to make it easier for users
-    /// to work with.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the type to search for.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use btf::BtfTypes;
-    /// use btf::types::Type;
-    ///
-    /// let vmlinux_types = BtfTypes::from_file("resources/vmlinux").unwrap();
-    /// let execve = vmlinux_types.resolve_type_by_name("do_execve").unwrap();
-    /// if let Type::FunctionProto(fp) = execve.base_type {
-    ///     let param_type = vmlinux_types.resolve_type_by_id(fp.params[0].type_id).unwrap();
-    ///     if param_type.is_pointer() && param_type.is_volatile {
-    ///         /* the first parameter to do_execve is a volatile pointer */
-    ///     }
-    /// }
-    /// ```
-    pub fn resolve_type_by_name(&self, name: &str) -> Option<QualifiedType> {
-        match self.name_map.get(name) {
-            Some(id) => self.resolve_type_by_id(*id),
-            None => None,
-        }
-    }
-
-    /// Adds a custom integer type to this BTF database.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the new type.
-    /// * `num_bytes` - The number of bytes used to represent the integer.
-    /// * `is_signed` - Whether the integer is signed or not.
+    /// Returns a slice of the internal types.
     ///
     /// # Example
     /// ```
-    /// use btf::{AddToBtf, BtfTypes, Type};
+    /// use btf::btf::{Btf, FlattenedType};
     ///
-    /// let mut btf = BtfTypes::default();
-    /// btf.add_integer("my_u32", 4, false).unwrap();
+    /// let btf = Btf::from_file("/sys/kernel/btf/vmlinux").expect("failed to parse btf");
+    /// let types: Vec<&FlattenedType> = btf.get_types().iter().collect();
+    /// assert!(types.len() > 0);
     /// ```
-    pub fn add_integer(&mut self, name: &str, num_bytes: u8, is_signed: bool) -> Option<&Type> {
-        if num_bytes >= 32 {
-            return None;
-        }
-
-        let id = self.types.len().try_into().ok()?;
-        let new_integer = Integer {
-            id,
-            name: name.to_string(),
-            size: num_bytes.into(),
-            bits: num_bytes * 8,
-            is_bool: false,
-            is_char: false,
-            is_signed,
-            offset: 0,
-        };
-
-        self.name_map.insert(name.to_string(), id);
-        self.types.push(Type::Integer(new_integer));
-
-        self.get_type_by_name(name)
+    pub fn get_types(&self) -> &[FlattenedType] {
+        &self.types
     }
 
-    /// Adds a custom array type to this BTF database.
+    /// Retrieves a type by its identifier.
     ///
     /// # Arguments
     ///
-    /// * `name` - The name of the new type.
-    /// * `index_type` - The name of the index type.
-    /// * `element_name` - The name of the type of the array elements.
-    /// * `count` - The number of elements
+    /// * `id` - The id of the type to flatten.
     ///
     /// # Example
     /// ```
-    /// use btf::{AddToBtf, BtfTypes, Type};
+    /// use btf::btf::Btf;
     ///
-    /// let mut btf = BtfTypes::default();
-    /// usize::add_to_btf(&mut btf).unwrap();
-    /// u8::add_to_btf(&mut btf).unwrap();
-    /// btf.add_array("my_array", "usize", "u8", 16).unwrap();
+    /// let btf = Btf::from_file("/sys/kernel/btf/vmlinux").expect("failed to parse btf");
+    /// btf.get_type_by_id(0).expect("Type 0 not found");
     /// ```
-    pub fn add_array(
-        &mut self,
-        name: &str,
-        index_type: &str,
-        element_type: &str,
-        count: u32,
-    ) -> Option<&Type> {
-        let id = self.types.len().try_into().ok()?;
-        let mut new_array = Array {
-            id,
-            size: 0,
-            element_type: 0,
-            index_type: 0,
-            num_elements: 0,
-        };
-
-        let index_type = self.get_type_by_name(index_type)?;
-        let element_type = self.get_type_by_name(element_type)?;
-        new_array.size = element_type.get_size() * count;
-        new_array.element_type = element_type.get_id()?;
-        new_array.index_type = index_type.get_id()?;
-        new_array.num_elements = count;
-
-        self.name_map.insert(name.to_string(), id);
-        self.types.push(Type::Array(new_array));
-
-        self.get_type_by_name(name)
+    pub fn get_type_by_id(&self, id: u32) -> Result<&FlattenedType> {
+        let index: usize = id.try_into()?;
+        self.types.get(index).ok_or(Error::InvalidTypeIndex)
     }
 
-    /// Adds a custom structure type to this BTF database.
+    /// Retrieves a type by its name.
     ///
     /// # Arguments
     ///
-    /// * `name` - The name of the new type.
-    /// * `fields` - A tuple describing the fields: `(name, type_name)`.
+    /// * `name` - The name of the type.
     ///
     /// # Example
     /// ```
-    /// use btf::{AddToBtf, BtfTypes, Type};
+    /// use btf::btf::Btf;
     ///
-    /// let mut btf = BtfTypes::default();
-    /// u32::add_to_btf(&mut btf).unwrap();
-    /// btf.add_struct("my_custom_struct", &[("int_field", "u32")]).unwrap();
+    /// let btf = Btf::from_file("/sys/kernel/btf/vmlinux").expect("failed to parse btf");
+    /// btf.get_type_by_name("task_struct").expect("task_struct not found");
     /// ```
-    pub fn add_struct(&mut self, name: &str, fields: &[(&str, &str)]) -> Option<&Type> {
-        let mut new_struct = Struct {
-            id: self.types.len().try_into().ok()?,
-            name: name.to_owned(),
-            size: 0,
-            members: HashMap::new(),
-        };
-
-        for (name, type_name) in fields {
-            let field_type = self.resolve_type_by_name(type_name)?;
-            let type_id = field_type.base_type.get_id()?;
-            let type_size = field_type.get_size();
-            let new_member = StructMember {
-                name: name.to_string(),
-                type_id,
-                bitfield_size: 0,
-                offset: new_struct.size * 8,
-            };
-            new_struct.members.insert(name.to_string(), new_member);
-            new_struct.size += type_size;
-        }
-
-        self.name_map.insert(name.to_string(), new_struct.id);
-        self.types.push(Type::Struct(new_struct));
-
-        self.get_type_by_name(name)
+    pub fn get_type_by_name(&self, name: &str) -> Result<&FlattenedType> {
+        let index = *self.name_map.get(name).ok_or(Error::TypeNotFound)?;
+        let index: usize = index.try_into()?;
+        self.types.get(index).ok_or(Error::InvalidTypeIndex)
     }
 }

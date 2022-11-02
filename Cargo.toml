@@ -12,3 +12,7 @@ description = "A library for parsing the BPF type format (BTF)."
 
 [dependencies]
 byteorder = "1.4.3"
+thiserror = "1.0.37"
+
+[dev-dependencies]
+anyhow = "1.0.65"
