@@ -46,7 +46,15 @@ impl<B: ByteOrder> Header<B> {
     /// # Arguments
     /// * `reader` - The reader from which the string is read.
     /// * `offset` - The offset of the string.
-    fn read_string<R: Read + Seek + BufRead>(&self, reader: &mut R, offset: u32) -> Result<String> {
+    fn read_string<R: Read + Seek + BufRead>(
+        &self,
+        reader: &mut R,
+        offset: u32,
+    ) -> Result<Option<String>> {
+        if offset == 0 {
+            return Ok(None);
+        }
+
         let oldpos = reader.stream_position()?;
         reader.seek(SeekFrom::Start(
             self.hdr_len as u64 + self.str_off as u64 + offset as u64,
@@ -54,18 +62,14 @@ impl<B: ByteOrder> Header<B> {
 
         let mut raw_str = vec![];
         reader.read_until(0, &mut raw_str)?;
+        raw_str.pop().ok_or(Error::Parsing {
+            offset: reader.stream_position()?,
+            message: "Reading raw string returned an empty buffer",
+        })?;
+        reader.seek(SeekFrom::Start(oldpos))?;
 
         match std::str::from_utf8(&raw_str) {
-            Ok(s) => {
-                if s.is_empty() {
-                    return Err(Error::Parsing {
-                        offset: reader.stream_position()?,
-                        message: "Found zero-sized string",
-                    });
-                }
-                reader.seek(SeekFrom::Start(oldpos))?;
-                Ok(String::from(&s[0..s.len() - 1]))
-            }
+            Ok(s) => Ok(Some(s.into())),
             Err(_) => Err(Error::Parsing {
                 offset: reader.stream_position()?,
                 message: "Failed to decode string",
@@ -173,7 +177,7 @@ impl TypeHeader {
         header: &Header<B>,
     ) -> Result<TypeHeader> {
         let name_off = reader.read_u32::<B>()?;
-        let name = header.read_string(reader, name_off).ok();
+        let name = header.read_string(reader, name_off)?;
         let info = reader.read_u32::<B>()?;
         let size_type = reader.read_u32::<B>()?;
 
@@ -310,7 +314,7 @@ impl Array {
 /// Represents a parsed BTF structure member (struct btf_member).
 #[derive(Clone, Debug, Default)]
 pub struct StructMember {
-    pub name: String,
+    pub name: Option<String>,
     pub type_id: u32,
     pub offset: u32,
     pub bits: Option<u32>,
@@ -383,7 +387,7 @@ impl Struct {
 /// Represents a parsed BTF enum member (struct btf_enum).
 #[derive(Clone, Debug, Default)]
 pub struct EnumEntry {
-    pub name: String,
+    pub name: Option<String>,
     pub value: i64,
 }
 
@@ -507,7 +511,7 @@ impl Function {
 /// Represents a parsed BTF function parameter (struct btf_param).
 #[derive(Clone, Debug, Default)]
 pub struct FunctionParam {
-    pub name: String,
+    pub name: Option<String>,
     pub type_id: u32,
 }
 
