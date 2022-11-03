@@ -24,11 +24,10 @@ struct Header<B> {
 }
 
 impl<B: ByteOrder> Header<B> {
-    /// Parses a BTF header given an endianess.
+    /// Parses a BTF header.
     ///
     /// # Arguments
     /// * `reader` - The reader from which the header is read.
-    /// * `endianess` - The endianess of the data; stored for parsing later on.
     fn from_reader<R: Read>(reader: &mut R) -> Result<Self> {
         Ok(Self {
             _version: reader.read_u8()?,
@@ -691,7 +690,7 @@ pub enum Type {
 }
 
 impl Type {
-    /// Called from `from_reader` with the appropriate endianess.
+    /// Parses a single BTF type from the reader (advances the reader past the type).
     ///
     /// # Arguments
     /// * `reader` - The reader from which the integer is read.
