@@ -4,19 +4,12 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::marker::PhantomData;
 use std::path::Path;
-
-/// Endian representation.
-#[derive(Clone, Copy, Debug, Default)]
-enum Endianess {
-    #[default]
-    Big,
-    Little,
-}
 
 /// Represents a parsed BTF file header (struct btf_header).
 #[derive(Clone, Copy, Debug, Default)]
-struct Header {
+struct Header<B> {
     _version: u8,
     _flags: u8,
     hdr_len: u32,
@@ -27,19 +20,16 @@ struct Header {
     str_off: u32,
     _str_len: u32,
 
-    endianess: Endianess,
+    endianess: PhantomData<B>,
 }
 
-impl Header {
+impl<B: ByteOrder> Header<B> {
     /// Parses a BTF header given an endianess.
     ///
     /// # Arguments
     /// * `reader` - The reader from which the header is read.
     /// * `endianess` - The endianess of the data; stored for parsing later on.
-    fn from_reader_with_order<B: ByteOrder, R: Read>(
-        reader: &mut R,
-        endianess: Endianess,
-    ) -> Result<Self> {
+    fn from_reader<R: Read>(reader: &mut R) -> Result<Self> {
         Ok(Self {
             _version: reader.read_u8()?,
             _flags: reader.read_u8()?,
@@ -48,24 +38,8 @@ impl Header {
             type_len: reader.read_u32::<B>()?,
             str_off: reader.read_u32::<B>()?,
             _str_len: reader.read_u32::<B>()?,
-            endianess,
+            endianess: PhantomData,
         })
-    }
-
-    /// Parses a BTF header from an object that implements Read.
-    ///
-    /// # Arguments
-    /// * `reader` - The reader from which the header is read.
-    fn from_reader<R: Read + Seek + BufRead>(reader: &mut R) -> Result<Self> {
-        let magic = reader.read_u16::<LittleEndian>()?;
-        match magic {
-            0xeb9f => Self::from_reader_with_order::<LittleEndian, _>(reader, Endianess::Little),
-            0x9feb => Self::from_reader_with_order::<BigEndian, _>(reader, Endianess::Big),
-            _ => Err(Error::Parsing {
-                offset: reader.stream_position()?,
-                message: "Invalid magic value",
-            }),
-        }
     }
 
     /// Read a string from the reader using the header as a reference.
@@ -111,12 +85,8 @@ impl Header {
 
         let mut types = vec![ParsedType::default()];
         loop {
-            let type_header = if matches!(self.endianess, Endianess::Little) {
-                TypeHeader::from_reader::<LittleEndian, _>(reader, self)?
-            } else {
-                TypeHeader::from_reader::<BigEndian, _>(reader, self)?
-            };
-            let ty = Type::from_reader(reader, &type_header, self)?;
+            let type_header = TypeHeader::from_reader::<B, _>(reader, self)?;
+            let ty = Type::from_reader::<B, _>(reader, &type_header, self)?;
             types.push(ParsedType {
                 header: type_header,
                 ty,
@@ -201,7 +171,7 @@ impl TypeHeader {
     /// * `header` - The header associated with this type.
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<TypeHeader> {
         let name_off = reader.read_u32::<B>()?;
         let name = header.read_string(reader, name_off).ok();
@@ -357,7 +327,7 @@ impl StructMember {
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         type_header: &TypeHeader,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<StructMember> {
         let name_off = reader.read_u32::<B>()?;
         let name = header.read_string(reader, name_off)?;
@@ -395,7 +365,7 @@ impl Struct {
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         type_header: &TypeHeader,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         let num_members = type_header.get_vlen();
         let mut members = Vec::<StructMember>::with_capacity(num_members.into());
@@ -426,7 +396,7 @@ impl EnumEntry {
     /// * `header` - The header associated with this type.
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead, const WIDE: bool>(
         reader: &mut R,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         let name_off = reader.read_u32::<B>()?;
         let name = header.read_string(reader, name_off)?;
@@ -457,7 +427,7 @@ impl Enum {
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         type_header: &TypeHeader,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         let is_signed = type_header.get_kind_flag();
         let num_entries = type_header.get_vlen();
@@ -550,7 +520,7 @@ impl FunctionParam {
     /// * `header` - The header associated with this type.
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         let name_off = reader.read_u32::<B>()?;
         let name = header.read_string(reader, name_off)?;
@@ -576,7 +546,7 @@ impl FunctionProto {
     fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         type_header: &TypeHeader,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         let num_params = type_header.get_vlen();
         let mut params = Vec::with_capacity(num_params.into());
@@ -727,10 +697,10 @@ impl Type {
     /// * `reader` - The reader from which the integer is read.
     /// * `type_header` - The BTF type header that was read for this type.
     /// * `header` - The header associated with this type.
-    fn from_reader_with_order<B: ByteOrder, R: Read + Seek + BufRead>(
+    fn from_reader<B: ByteOrder, R: Read + Seek + BufRead>(
         reader: &mut R,
         type_header: &TypeHeader,
-        header: &Header,
+        header: &Header<B>,
     ) -> Result<Self> {
         match type_header.get_kind()? {
             TypeKind::Void => Ok(Self::Void),
@@ -779,28 +749,6 @@ impl Type {
                 type_header,
                 header,
             )?)),
-        }
-    }
-
-    /// Reads types that follow the BTF header. Consumes a variable number of bytes from the
-    /// reader depending on the type that is read.
-    ///
-    /// # Arguments
-    /// * `reader` - The reader from which the integer is read.
-    /// * `type_header` - The BTF type header that was read for this type.
-    /// * `header` - The header associated with this type.
-    fn from_reader<R: Read + Seek + BufRead>(
-        reader: &mut R,
-        type_header: &TypeHeader,
-        header: &Header,
-    ) -> Result<Self> {
-        match header.endianess {
-            Endianess::Little => {
-                Self::from_reader_with_order::<LittleEndian, _>(reader, type_header, header)
-            }
-            Endianess::Big => {
-                Self::from_reader_with_order::<BigEndian, _>(reader, type_header, header)
-            }
         }
     }
 }
@@ -990,6 +938,33 @@ pub struct Btf {
 }
 
 impl Btf {
+    fn inner_from_file<B: ByteOrder, R: BufRead + Seek>(mut reader: R) -> Result<Self> {
+        /*
+         * Arbitrary threshold of 50 MB to limit memory usage when parsing. If the
+         * file is over 50MB the file is used to seek/parse, otherwise all data is
+         * read into memory and then parsed. The latter is much quicker.
+         */
+        let header = Header::<B>::from_reader(&mut reader)?;
+        let types = header.read_types(&mut reader)?;
+
+        let mut name_map = HashMap::default();
+        let mut flattened_types = vec![];
+        for id in 0..types.len() {
+            let index = id.try_into()?;
+            let mut flattened_type = FlattenedType::from_parsed_types(&types, index)?;
+            flattened_type.bits = FlattenedType::get_parsed_type_bits(&types, index, 0)?;
+            for name in &flattened_type.names {
+                name_map.insert(name.clone(), index);
+            }
+            flattened_types.push(flattened_type);
+        }
+
+        Ok(Btf {
+            types: flattened_types,
+            name_map,
+        })
+    }
+
     /// Parses a BTF file into a vector of types.
     ///
     /// # Arguments
@@ -1009,33 +984,30 @@ impl Btf {
          * read into memory and then parsed. The latter is much quicker.
          */
         let meta = std::fs::metadata(&path)?;
-        let types = if meta.len() > 50 << 20 {
+        if meta.len() > 50 << 20 {
             let mut reader = BufReader::new(std::fs::File::open(&path)?);
-            let header = Header::from_reader(&mut reader)?;
-            header.read_types(&mut reader)?
+            let magic = reader.read_u16::<LittleEndian>()?;
+            match magic {
+                0xeb9f => Self::inner_from_file::<LittleEndian, _>(reader),
+                0x9feb => Self::inner_from_file::<BigEndian, _>(reader),
+                _ => Err(Error::Parsing {
+                    offset: reader.stream_position()?,
+                    message: "Invalid magic value",
+                }),
+            }
         } else {
             let data = std::fs::read(path)?;
             let mut reader = Cursor::new(data);
-            let header = Header::from_reader(&mut reader)?;
-            header.read_types(&mut reader)?
-        };
-
-        let mut name_map = HashMap::default();
-        let mut flattened_types = vec![];
-        for id in 0..types.len() {
-            let index = id.try_into()?;
-            let mut flattened_type = FlattenedType::from_parsed_types(&types, index)?;
-            flattened_type.bits = FlattenedType::get_parsed_type_bits(&types, index, 0)?;
-            for name in &flattened_type.names {
-                name_map.insert(name.clone(), index);
+            let magic = reader.read_u16::<LittleEndian>()?;
+            match magic {
+                0xeb9f => Self::inner_from_file::<LittleEndian, _>(reader),
+                0x9feb => Self::inner_from_file::<BigEndian, _>(reader),
+                _ => Err(Error::Parsing {
+                    offset: reader.stream_position()?,
+                    message: "Invalid magic value",
+                }),
             }
-            flattened_types.push(flattened_type);
         }
-
-        Ok(Btf {
-            types: flattened_types,
-            name_map,
-        })
     }
 
     /// Returns a slice of the internal types.
