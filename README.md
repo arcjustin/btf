@@ -15,5 +15,9 @@ For usage examples, see code located in [examples/](examples/) :
   |[print-type](examples/print-type.rs)| Prints a type given a path to a BTF file and a type name|
 
 ## TODO
-- Add proper errors.
-- Optimize / Reduce cloning 
+
+* Write more thorough tests.
+
+## License
+
+* [MIT license](http://opensource.org/licenses/MIT)
