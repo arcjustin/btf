@@ -81,6 +81,7 @@ impl Header {
 
         let mut raw_str = vec![];
         reader.read_until(0, &mut raw_str)?;
+        raw_str.pop().unwrap();
 
         match std::str::from_utf8(&raw_str) {
             Ok(s) => {
@@ -91,7 +92,7 @@ impl Header {
                     });
                 }
                 reader.seek(SeekFrom::Start(oldpos))?;
-                Ok(String::from(&s[0..s.len() - 1]))
+                Ok(s.into())
             }
             Err(_) => Err(Error::Parsing {
                 offset: reader.stream_position()?,
