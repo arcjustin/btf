@@ -51,10 +51,6 @@ impl<B: ByteOrder> Header<B> {
         reader: &mut R,
         offset: u32,
     ) -> Result<Option<String>> {
-        if offset == 0 {
-            return Ok(None);
-        }
-
         let oldpos = reader.stream_position()?;
         reader.seek(SeekFrom::Start(
             self.hdr_len as u64 + self.str_off as u64 + offset as u64,
