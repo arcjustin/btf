@@ -937,12 +937,7 @@ pub struct Btf {
 }
 
 impl Btf {
-    fn inner_from_file<B: ByteOrder, R: BufRead + Seek>(mut reader: R) -> Result<Self> {
-        /*
-         * Arbitrary threshold of 50 MB to limit memory usage when parsing. If the
-         * file is over 50MB the file is used to seek/parse, otherwise all data is
-         * read into memory and then parsed. The latter is much quicker.
-         */
+    fn inner_from_reader<B: ByteOrder, R: BufRead + Seek>(mut reader: R) -> Result<Self> {
         let header = Header::<B>::from_reader(&mut reader)?;
         let types = header.read_types(&mut reader)?;
 
@@ -987,8 +982,8 @@ impl Btf {
             let mut reader = BufReader::new(std::fs::File::open(&path)?);
             let magic = reader.read_u16::<LittleEndian>()?;
             match magic {
-                0xeb9f => Self::inner_from_file::<LittleEndian, _>(reader),
-                0x9feb => Self::inner_from_file::<BigEndian, _>(reader),
+                0xeb9f => Self::inner_from_reader::<LittleEndian, _>(reader),
+                0x9feb => Self::inner_from_reader::<BigEndian, _>(reader),
                 _ => Err(Error::Parsing {
                     offset: reader.stream_position()?,
                     message: "Invalid magic value",
@@ -999,8 +994,8 @@ impl Btf {
             let mut reader = Cursor::new(data);
             let magic = reader.read_u16::<LittleEndian>()?;
             match magic {
-                0xeb9f => Self::inner_from_file::<LittleEndian, _>(reader),
-                0x9feb => Self::inner_from_file::<BigEndian, _>(reader),
+                0xeb9f => Self::inner_from_reader::<LittleEndian, _>(reader),
+                0x9feb => Self::inner_from_reader::<BigEndian, _>(reader),
                 _ => Err(Error::Parsing {
                     offset: reader.stream_position()?,
                     message: "Invalid magic value",
