@@ -937,6 +937,12 @@ pub struct Btf {
 }
 
 impl Btf {
+    /// Reads the header using a specified endianess. This is called in `from_reader`
+    /// after endianess has been determined.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - A reader interface into the BTF data.
     fn inner_from_reader<B: ByteOrder, R: BufRead + Seek>(mut reader: R) -> Result<Self> {
         let header = Header::<B>::from_reader(&mut reader)?;
         let types = header.read_types(&mut reader)?;
