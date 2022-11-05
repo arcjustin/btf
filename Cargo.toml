@@ -1,6 +1,6 @@
 [package]
 name = "btf"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 categories = ["parser-implementations", "data-structures"]
 homepage = "https://github.com/arcjustin/btf"
