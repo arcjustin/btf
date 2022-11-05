@@ -560,6 +560,7 @@ impl FunctionProto {
 /// Represents a parsed BTF variable type (struct btf_var).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Variable {
+    pub type_id: u32,
     pub linkage: LinkageKind,
 }
 
@@ -568,14 +569,21 @@ impl Variable {
     ///
     /// # Arguments
     /// * `reader` - The reader from which the integer is read.
-    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+    /// * `type_header` - The type header associated with the variable.
+    fn from_reader<B: ByteOrder, R: Read>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+    ) -> Result<Self> {
         let linkage = match reader.read_u32::<B>()? {
             0 => LinkageKind::Static,
             1 => LinkageKind::Global,
             _ => return Err(Error::InvalidLinkageKind),
         };
 
-        Ok(Self { linkage })
+        Ok(Self {
+            type_id: type_header.get_type(),
+            linkage,
+        })
     }
 }
 
@@ -648,6 +656,7 @@ impl Float {
 /// Represents a parsed BTF decl tag.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeclTag {
+    pub type_id: u32,
     pub component_index: u32,
 }
 
@@ -656,8 +665,13 @@ impl DeclTag {
     ///
     /// # Arguments
     /// * `reader` - The reader from which the integer is read.
-    fn from_reader<B: ByteOrder, R: Read>(reader: &mut R) -> Result<Self> {
+    /// * `type_header` - The type header associated with the variable.
+    fn from_reader<B: ByteOrder, R: Read>(
+        reader: &mut R,
+        type_header: &TypeHeader,
+    ) -> Result<Self> {
         Ok(Self {
+            type_id: type_header.get_type(),
             component_index: reader.read_u32::<B>()?,
         })
     }
@@ -735,13 +749,19 @@ impl Type {
                 type_header,
                 header,
             )?)),
-            TypeKind::Variable => Ok(Self::Variable(Variable::from_reader::<B, _>(reader)?)),
+            TypeKind::Variable => Ok(Self::Variable(Variable::from_reader::<B, _>(
+                reader,
+                type_header,
+            )?)),
             TypeKind::DataSection => Ok(Self::DataSection(DataSection::from_reader::<B, _>(
                 reader,
                 type_header,
             )?)),
             TypeKind::Float => Ok(Self::Float(Float::from_type_header(type_header))),
-            TypeKind::DeclTag => Ok(Self::DeclTag(DeclTag::from_reader::<B, _>(reader)?)),
+            TypeKind::DeclTag => Ok(Self::DeclTag(DeclTag::from_reader::<B, _>(
+                reader,
+                type_header,
+            )?)),
             TypeKind::TypeTag => Ok(Self::TypeTag(TypeMap::from_type_header(type_header))),
             TypeKind::Enum64 => Ok(Self::Enum64(Enum::from_reader::<B, _>(
                 reader,
@@ -767,12 +787,14 @@ pub struct FlattenedType {
     pub bits: u32,
     pub base_type: Type,
     pub num_refs: u32,
-    pub names: Vec<String>,
-    pub tags: Vec<String>,
+    pub name: Option<String>,
+    pub type_tags: Vec<String>,
+    pub decl_tags: Vec<(u32, String)>,
     pub is_volatile: bool,
     pub is_const: bool,
     pub is_restrict: bool,
     pub is_function: bool,
+    pub linkage: LinkageKind,
 }
 
 impl FlattenedType {
@@ -841,12 +863,14 @@ impl FlattenedType {
     fn from_parsed_types(types: &[ParsedType], id: u32) -> Result<Self> {
         let mut index: usize = id.try_into()?;
         let mut num_refs = 0;
-        let mut names = vec![];
-        let mut tags = vec![];
+        let mut name = None;
+        let mut type_tags = vec![];
+        let mut decl_tags = vec![];
         let mut is_volatile = false;
         let mut is_const = false;
         let mut is_restrict = false;
         let mut is_function = false;
+        let mut linkage = LinkageKind::Static;
         let mut base_type: &Type;
 
         let mut i = 0;
@@ -860,18 +884,20 @@ impl FlattenedType {
             let ty = types.get(index).ok_or(Error::InvalidTypeIndex)?;
             base_type = &ty.ty;
             match base_type {
-                Type::Integer(_)
+                Type::Void
+                | Type::Integer(_)
+                | Type::Array(_)
                 | Type::Struct(_)
                 | Type::Union(_)
                 | Type::Enum32(_)
                 | Type::Enum64(_)
                 | Type::Fwd(_)
+                | Type::FunctionProto(_)
                 | Type::DataSection(_)
                 | Type::Float(_) => {
-                    if let Some(name) = &ty.header.name {
-                        if i == 1 {
-                            names.push(name.clone());
-                        }
+                    // only use the base's name, if it's not part of a chained type
+                    if name.is_none() && i == 1 {
+                        name = ty.header.name.clone();
                     }
                     break;
                 }
@@ -880,9 +906,7 @@ impl FlattenedType {
                     index = t.type_id.try_into()?;
                 }
                 Type::Typedef(t) => {
-                    if let Some(name) = &ty.header.name {
-                        names.push(name.clone());
-                    }
+                    name = ty.header.name.clone();
                     index = t.type_id.try_into()?;
                 }
                 Type::Volatile(t) => {
@@ -898,19 +922,27 @@ impl FlattenedType {
                     index = t.type_id.try_into()?;
                 }
                 Type::Function(t) => {
-                    if let Some(name) = &ty.header.name {
-                        names.push(name.clone());
-                    }
+                    name = ty.header.name.clone();
                     is_function = true;
+                    index = t.type_id.try_into()?;
+                }
+                Type::Variable(t) => {
+                    name = ty.header.name.clone();
+                    linkage = t.linkage;
                     index = t.type_id.try_into()?;
                 }
                 Type::TypeTag(t) => {
                     if let Some(name) = &ty.header.name {
-                        tags.push(name.clone());
+                        type_tags.push(name.clone());
                     }
                     index = t.type_id.try_into()?;
                 }
-                _ => break,
+                Type::DeclTag(t) => {
+                    if let Some(name) = &ty.header.name {
+                        decl_tags.push((t.component_index, name.clone()));
+                    }
+                    index = t.type_id.try_into()?;
+                }
             }
         }
 
@@ -919,12 +951,14 @@ impl FlattenedType {
             bits: 0,
             base_type: base_type.clone(),
             num_refs,
-            names,
-            tags,
+            name,
+            type_tags,
+            decl_tags,
             is_volatile,
             is_const,
             is_restrict,
             is_function,
+            linkage,
         })
     }
 }
@@ -953,7 +987,7 @@ impl Btf {
             let index = id.try_into()?;
             let mut flattened_type = FlattenedType::from_parsed_types(&types, index)?;
             flattened_type.bits = FlattenedType::get_parsed_type_bits(&types, index, 0)?;
-            for name in &flattened_type.names {
+            if let Some(name) = &flattened_type.name {
                 name_map.insert(name.clone(), index);
             }
             flattened_types.push(flattened_type);
