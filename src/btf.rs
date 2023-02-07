@@ -1018,29 +1018,43 @@ impl Btf {
          * read into memory and then parsed. The latter is much quicker.
          */
         let meta = std::fs::metadata(&path)?;
+
         if meta.len() > 50 << 20 {
-            let mut reader = BufReader::new(std::fs::File::open(&path)?);
-            let magic = reader.read_u16::<LittleEndian>()?;
-            match magic {
-                0xeb9f => Self::inner_from_reader::<LittleEndian, _>(reader),
-                0x9feb => Self::inner_from_reader::<BigEndian, _>(reader),
-                _ => Err(Error::Parsing {
-                    offset: reader.stream_position()?,
-                    message: "Invalid magic value",
-                }),
-            }
+            let reader = BufReader::new(std::fs::File::open(&path)?);
+            Self::from_reader(reader)
         } else {
             let data = std::fs::read(path)?;
-            let mut reader = Cursor::new(data);
-            let magic = reader.read_u16::<LittleEndian>()?;
-            match magic {
-                0xeb9f => Self::inner_from_reader::<LittleEndian, _>(reader),
-                0x9feb => Self::inner_from_reader::<BigEndian, _>(reader),
-                _ => Err(Error::Parsing {
-                    offset: reader.stream_position()?,
-                    message: "Invalid magic value",
-                }),
-            }
+            let reader = Cursor::new(data);
+            Self::from_reader(reader)
+        }
+    }
+
+    /// Parses a BTF document into a vector of types.
+    ///
+    /// # Arguments
+    /// * `slice` - A slice of memory containing the BTF information.
+    ///
+    /// # Example
+    /// ```
+    /// use btf::btf::Btf;
+    ///
+    /// let data = std::fs::read("/sys/kernel/btf/vmlinux").expect("failed to open vmlinux");
+    /// let btf = Btf::from_bytes(&data).expect("failed to parse btf");
+    /// ```
+    pub fn from_bytes(slice: &[u8]) -> Result<Self> {
+        let reader = Cursor::new(slice);
+        Self::from_reader(reader)
+    }
+
+    fn from_reader<R: BufRead + Seek>(mut reader: R) -> Result<Self> {
+        let magic = reader.read_u16::<LittleEndian>()?;
+        match magic {
+            0xeb9f => Self::inner_from_reader::<LittleEndian, _>(reader),
+            0x9feb => Self::inner_from_reader::<BigEndian, _>(reader),
+            _ => Err(Error::Parsing {
+                offset: reader.stream_position()?,
+                message: "Invalid magic value",
+            }),
         }
     }
 
